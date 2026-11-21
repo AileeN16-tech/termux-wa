@@ -1,0 +1,19 @@
+{
+  "name": "bot-wa-termux",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot All-in-One Downloader (IG, TikTok, FB, X, Threads, YouTube) & Pembuat Stiker khusus Termux Android",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "start:loop": "bash start.sh",
+    "setup:termux": "bash install.sh",
+    "clean:session": "rm -rf .wwebjs_auth .wwebjs_cache temp_downloads"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "latest"
+  }
+}
