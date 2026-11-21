@@ -30,6 +30,8 @@ const ytDlpCandidates = [
 const ytDlpPath = ytDlpCandidates.find((p) => p && fs.existsSync(p)) || 'yt-dlp';
 
 const agyCandidates = [
+    homeDir ? path.join(homeDir, '.local', 'bin', 'agy-run') : '',
+    path.join(termuxBinDir, 'agy-run'),
     path.join(termuxBinDir, 'agy'),
     homeDir ? path.join(homeDir, '.local', 'bin', 'agy') : '',
     '/usr/local/bin/agy',
@@ -52,6 +54,19 @@ const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 
+const AGY_TIMEOUT_MS = Number(process.env.AGY_TIMEOUT_MS) || 300000;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const IMAGE_MIME_BY_EXT = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.webp': 'image/webp',
+    '.avif': 'image/avif',
+    '.heic': 'image/heic'
+};
+const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.aac', '.ogg', '.opus', '.wav', '.flac']);
+
 let sock = null;
 let baileys = null;
 let baileysLogger = null;
@@ -69,7 +84,7 @@ function formatKeWhatsApp(teks) {
 }
 
 // Menjalankan perintah Antigravity (agy -p "<pertanyaan>") secara headless
-function tanyaAgy(pertanyaan, timeoutMs = 120000) {
+function tanyaAgy(pertanyaan, timeoutMs = AGY_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
         const proses = spawn(agyPath, ['-p', pertanyaan]);
         let output = '';
@@ -79,7 +94,7 @@ function tanyaAgy(pertanyaan, timeoutMs = 120000) {
             try {
                 proses.kill();
             } catch {}
-            reject(new Error('Waktu tunggu balasan AI habis (Timeout 120 detik).'));
+            reject(new Error(`Waktu tunggu balasan AI habis (Timeout ${Math.round(timeoutMs / 1000)} detik).`));
         }, timeoutMs);
 
         proses.stdout.on('data', (data) => {
@@ -670,9 +685,11 @@ async function extractThreadsMedia(rawUrl) {
                     }
                 }
 
-                const imgMatches = html.matchAll(/<img[^>]+class=["'][^"']*SingleInnerMedia[^"']*["'][^>]+src=["']([^"']+)["']/gi);
-                for (const m of imgMatches) {
-                    const iUrl = m[1].replace(/&amp;/g, '&');
+                for (const tag of html.match(/<img\b[^>]*>/gi) || []) {
+                    if (!/class=["'][^"']*SingleInnerMedia/i.test(tag)) continue;
+                    const sm = tag.match(/\bsrc=["']([^"']+)["']/i);
+                    if (!sm) continue;
+                    const iUrl = sm[1].replace(/&amp;/g, '&');
                     if (!seen.has(iUrl)) {
                         seen.add(iUrl);
                         items.push({ type: 'image', url: iUrl });
@@ -720,16 +737,19 @@ async function inspectUrlSafe(url) {
         }
 
         const html = await res.text();
-        const ogMatch =
-            html.match(/<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]+content=["']([^"']+)["']/i) ||
-            html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image|twitter:image)["']/i);
-
-        let ogImageUrl = ogMatch ? ogMatch[1].replace(/&amp;/g, '&') : null;
-        if (ogImageUrl && ogImageUrl.startsWith('/')) {
-            ogImageUrl = new URL(ogImageUrl, res.url).href;
+        const ogImageUrls = [];
+        for (const tag of html.match(/<meta\b[^>]*>/gi) || []) {
+            if (!/(?:property|name)=["'](?:og:image(?::url|:secure_url)?|twitter:image(?::src)?)["']/i.test(tag)) continue;
+            const c = tag.match(/content=["']([^"']+)["']/i);
+            if (!c) continue;
+            try {
+                const abs = new URL(c[1].replace(/&amp;/g, '&'), res.url).href;
+                if (!ogImageUrls.includes(abs)) ogImageUrls.push(abs);
+            } catch {}
+            if (ogImageUrls.length >= 10) break;
         }
 
-        return { type: 'webpage', directUrl: res.url, ogImageUrl };
+        return { type: 'webpage', directUrl: res.url, ogImageUrl: ogImageUrls[0] || null, ogImageUrls };
     } catch {
         return { type: 'unknown', directUrl: url, ogImageUrl: null };
     }
@@ -790,12 +810,15 @@ function runYtDlpProcess(url, mode, allowPlaylist, options = {}) {
             '--geo-bypass',
             '--retries', '3',
             '--fragment-retries', '3',
-            '--socket-timeout', '25',
-            '--ffmpeg-location', ffmpegPath
+            '--socket-timeout', '25'
         ];
 
+        if (path.isAbsolute(ffmpegPath) && fs.existsSync(ffmpegPath)) {
+            commonFlags.push('--ffmpeg-location', ffmpegPath);
+        }
+
         if (allowPlaylist) {
-            commonFlags.push('--yes-playlist', '--playlist-end', '10');
+            commonFlags.push('--yes-playlist', '--playlist-end', '30');
         } else {
             commonFlags.push('--no-playlist');
         }
@@ -805,7 +828,7 @@ function runYtDlpProcess(url, mode, allowPlaylist, options = {}) {
         }
 
         if (useJsRuntime) {
-            commonFlags.push('--js-runtimes', 'node');
+            commonFlags.push('--js-runtimes', `node:${process.execPath}`);
         }
 
         if (useRemoteComponents) {
@@ -849,7 +872,7 @@ function runYtDlpProcess(url, mode, allowPlaylist, options = {}) {
 
                 if (downloadedFiles.length === 0) {
                     cleanupFileIdArtifacts(fileId);
-                    const rawMsg = (stderr || stdout || (error ? error.message : '') || 'File hasil unduhan tidak ditemukan.').trim();
+                    const rawMsg = (stderr || stdout || (error ? error.message : '') || 'File hasil unduhan tidak ditemukan.').trim().slice(-1500);
                     return reject(new Error(rawMsg));
                 }
 
@@ -872,6 +895,13 @@ function runYtDlpProcess(url, mode, allowPlaylist, options = {}) {
             }
         );
     });
+}
+
+// Error yang tidak akan teratasi dengan strategi lain (hemat waktu, langsung berhenti)
+function isPermanentYtDlpError(msg) {
+    return /Private video|This video is private|has been removed|account associated with this video has been terminated|blocked it on copyright|Join this channel|members-only|Premieres in|live event will begin|Unsupported URL/i.test(
+        msg
+    );
 }
 
 async function downloadWithYtDlp(url, mode = 'video', allowPlaylist = false) {
@@ -899,6 +929,7 @@ async function downloadWithYtDlp(url, mode = 'video', allowPlaylist = false) {
                 label: 'YouTube client tv/web_embedded/mweb',
                 options: {
                     useJsRuntime: caps.supportsJsRuntimes,
+                    useRemoteComponents: caps.supportsRemoteComponents,
                     extraArgs: ['--extractor-args', 'youtube:player_client=tv,web_embedded,mweb']
                 }
             },
@@ -933,8 +964,9 @@ async function downloadWithYtDlp(url, mode = 'video', allowPlaylist = false) {
             return await runYtDlpProcess(url, mode, allowPlaylist, options);
         } catch (err) {
             lastErr = err;
-            const brief = String(err.message || err).split('\n').slice(-2).join(' | ');
+            const brief = String(err.message || err).split('\n').slice(-4).join(' | ').slice(0, 600);
             console.warn(`[yt-dlp] Gagal (${label}): ${brief}`);
+            if (isPermanentYtDlpError(String(err.message || err))) break;
         }
     }
 
@@ -960,6 +992,15 @@ function clearYoutubeSession(chatId) {
     }
 }
 
+function briefReason(msg) {
+    const lines = String(msg || '')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+    const errLine = [...lines].reverse().find((l) => /^ERROR:/i.test(l)) || lines[lines.length - 1] || '';
+    return errLine.replace(/^ERROR:\s*/i, '').slice(0, 220);
+}
+
 function formatFriendlyError(err) {
     const msg = String(err?.message || err || '');
 
@@ -978,7 +1019,20 @@ function formatFriendlyError(err) {
     if (/no such option|Unsupported URL/i.test(msg)) {
         return 'Link tidak didukung atau *yt-dlp* perlu diperbarui (`pip install -U yt-dlp`).';
     }
-    return 'Gagal mengunduh media. Pastikan link bersifat publik, valid, dan bukan akun private.';
+    if (/Requested format is not available|n challenge|nsig|JavaScript runtime|EJS|ejs:/i.test(msg)) {
+        return (
+            'YouTube gagal diproses (tantangan JavaScript / format tidak tersedia). ' +
+            'Perbarui yt-dlp di Termux, lalu coba lagi.\n\nDetail: ' + briefReason(msg)
+        );
+    }
+    if (/HTTP Error 403|HTTP Error 429|Too Many Requests/i.test(msg)) {
+        return 'Server menolak unduhan (403/429). Coba lagi beberapa menit lagi, atau pakai *cookies.txt*.\n\nDetail: ' + briefReason(msg);
+    }
+    const detail = briefReason(msg);
+    return (
+        'Gagal mengunduh media. Pastikan link bersifat publik, valid, dan bukan akun private.' +
+        (detail ? `\n\nDetail: ${detail}` : '')
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,33 +1240,78 @@ async function fetchImageBuffer(mediaUrl, referer = 'https://www.instagram.com/'
 }
 
 async function sendExtractedMediaItems(jid, items, referer, makeStickerFlag, quoted) {
-    for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        console.log(`Mengirim media ${i + 1}/${items.length} (${item.type})...`);
+    // Buang duplikat URL agar tidak terkirim dobel
+    const seen = new Set();
+    const list = items.filter((it) => it && it.url && !seen.has(it.url) && seen.add(it.url));
 
-        if (item.type === 'video') {
-            const tempVideo = await downloadUrlToTempFile(item.url, referer, 'mp4');
-            await sendVideoFileFromDisk(jid, tempVideo, quoted);
-        } else {
-            const { buffer, contentType } = await fetchImageBuffer(item.url, referer);
-            await sendImageBuffer(jid, buffer, contentType, makeStickerFlag, quoted);
+    let sent = 0;
+    let lastErr = null;
+
+    for (let i = 0; i < list.length; i++) {
+        const item = list[i];
+        console.log(`Mengirim media ${i + 1}/${list.length} (${item.type})...`);
+
+        let ok = false;
+        for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
+            try {
+                if (item.type === 'video') {
+                    const tempVideo = await downloadUrlToTempFile(item.url, referer, 'mp4');
+                    await sendVideoFileFromDisk(jid, tempVideo, quoted);
+                } else {
+                    const { buffer, contentType } = await fetchImageBuffer(item.url, referer);
+                    await sendImageBuffer(jid, buffer, contentType, makeStickerFlag, quoted);
+                }
+                ok = true;
+            } catch (err) {
+                lastErr = err;
+                console.warn(`[Media ${i + 1}/${list.length}] percobaan ${attempt} gagal: ${err.message || err}`);
+                if (attempt < 2) await sleep(1500);
+            }
         }
+        if (ok) sent++;
+        if (i < list.length - 1) await sleep(600);
     }
+
+    if (sent === 0) throw lastErr || new Error('Semua media gagal dikirim.');
+    if (sent < list.length) {
+        await sendText(jid, `⚠️ ${sent} dari ${list.length} media berhasil dikirim.`, quoted).catch(() => {});
+    }
+    return sent;
 }
 
 async function downloadAndSendViaYtDlp(jid, url, mode = 'video', allowPlaylist = true, quoted) {
     const filePaths = await downloadWithYtDlp(url, mode, allowPlaylist);
+    let sent = 0;
+    let lastErr = null;
+
     try {
-        for (const filePath of filePaths) {
-            if (mode === 'audio') {
-                await sendAudioFileFromDisk(jid, filePath, quoted);
+        for (let i = 0; i < filePaths.length; i++) {
+            const filePath = filePaths[i];
+            const ext = path.extname(filePath).toLowerCase();
+            try {
+                if (mode === 'audio' || AUDIO_EXTS.has(ext)) {
+                    await sendAudioFileFromDisk(jid, filePath, quoted);
+                } else if (IMAGE_MIME_BY_EXT[ext]) {
+                    await sendImageBuffer(jid, fs.readFileSync(filePath), IMAGE_MIME_BY_EXT[ext], false, quoted);
+                } else {
+                    await sendVideoFileFromDisk(jid, filePath, quoted);
+                }
+                sent++;
+            } catch (err) {
+                lastErr = err;
+                console.warn(`[WA] Gagal mengirim file ${i + 1}/${filePaths.length}: ${err.message || err}`);
+            } finally {
                 safeUnlink(filePath);
-            } else {
-                await sendVideoFileFromDisk(jid, filePath, quoted);
             }
+            if (i < filePaths.length - 1) await sleep(600);
         }
     } finally {
         for (const filePath of filePaths) safeUnlink(filePath);
+    }
+
+    if (sent === 0) throw lastErr || new Error('Tidak ada media yang berhasil dikirim.');
+    if (sent < filePaths.length) {
+        await sendText(jid, `⚠️ ${sent} dari ${filePaths.length} media berhasil dikirim.`, quoted).catch(() => {});
     }
 }
 
@@ -1332,7 +1431,7 @@ async function handleMessage(msg) {
                     await sendText(jid, formatKeWhatsApp(balasan), msg);
                     await react(msg, '✅');
                 } else {
-                    await sendText(jid, 'Maaf, AI tidak memberikan balasan.', msg);
+                    await sendText(jid, 'Maaf, AI tidak memberikan balasan. Pastikan agy sudah login (jalankan `agy-run` sekali di Termux).', msg);
                     await react(msg, '⚠️');
                 }
             } catch (aiErr) {
@@ -1443,9 +1542,9 @@ async function handleMessage(msg) {
                 return;
             } catch (fbErr) {
                 const fbInfo = await inspectUrlSafe(resolvedFbUrl);
-                if (fbInfo.ogImageUrl) {
-                    const { buffer, contentType } = await fetchImageBuffer(fbInfo.ogImageUrl, resolvedFbUrl);
-                    await sendImageBuffer(jid, buffer, contentType, makeStickerFlag, msg);
+                if (fbInfo.ogImageUrls && fbInfo.ogImageUrls.length > 0) {
+                    const imgItems = fbInfo.ogImageUrls.map((u) => ({ type: 'image', url: u }));
+                    await sendExtractedMediaItems(jid, imgItems, resolvedFbUrl, makeStickerFlag, msg);
                     await react(msg, '✅');
                     return;
                 }
@@ -1492,9 +1591,9 @@ async function handleMessage(msg) {
             await downloadAndSendViaYtDlp(jid, info.directUrl || url, 'video', true, msg);
             await react(msg, '✅');
         } catch (ytError) {
-            if (info.ogImageUrl) {
-                const { buffer, contentType } = await fetchImageBuffer(info.ogImageUrl, url);
-                await sendImageBuffer(jid, buffer, contentType, makeStickerFlag, msg);
+            if (info.ogImageUrls && info.ogImageUrls.length > 0) {
+                const imgItems = info.ogImageUrls.map((u) => ({ type: 'image', url: u }));
+                await sendExtractedMediaItems(jid, imgItems, url, makeStickerFlag, msg);
                 await react(msg, '✅');
             } else {
                 throw ytError;
@@ -1679,4 +1778,13 @@ if (require.main === module) {
     });
 }
 
-module.exports = { handleMessage, makeSticker, _setSock: (s, b) => { sock = s; baileys = b; } };
+module.exports = {
+    handleMessage,
+    makeSticker,
+    sendExtractedMediaItems,
+    downloadAndSendViaYtDlp,
+    inspectUrlSafe,
+    formatFriendlyError,
+    isPermanentYtDlpError,
+    _setSock: (s, b) => { sock = s; baileys = b; }
+};
