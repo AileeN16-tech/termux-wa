@@ -37,6 +37,26 @@ const agyCandidates = [
 ];
 const agyPath = process.env.AGY_PATH || agyCandidates.find((p) => p && fs.existsSync(p)) || 'agy';
 
+const tempDir = path.join(__dirname, 'temp_downloads');
+const authDir = path.join(__dirname, 'auth_info');
+if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+for (const file of fs.readdirSync(tempDir)) {
+    try {
+        fs.unlinkSync(path.join(tempDir, file));
+    } catch {}
+}
+
+const pendingYoutubeChoices = new Map();
+const CHOICE_TIMEOUT_MS = 2 * 60 * 1000;
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+const USER_AGENT =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+
+let sock = null;
+let baileys = null;
+let baileysLogger = null;
+let ytDlpCapsPromise = null;
+
 // Konversi format Markdown standar AI ke format WhatsApp
 function formatKeWhatsApp(teks) {
     if (!teks) return '';
@@ -86,24 +106,83 @@ function tanyaAgy(pertanyaan, timeoutMs = 120000) {
     });
 }
 
-const tempDir = path.join(__dirname, 'temp_downloads');
-const authDir = path.join(__dirname, 'auth_info');
-if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-for (const file of fs.readdirSync(tempDir)) {
-    try {
-        fs.unlinkSync(path.join(tempDir, file));
-    } catch {}
+function getEnvWithNode() {
+    const nodeDir = path.dirname(process.execPath);
+    return {
+        ...process.env,
+        PATH: `${nodeDir}${path.delimiter}${termuxBinDir}${path.delimiter}${process.env.PATH || ''}`
+    };
 }
 
-const pendingYoutubeChoices = new Map();
-const CHOICE_TIMEOUT_MS = 2 * 60 * 1000;
-const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
-const USER_AGENT =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+function getCookiesFilePath() {
+    const candidates = [
+        process.env.COOKIES_FILE,
+        path.join(__dirname, 'cookies.txt'),
+        homeDir ? path.join(homeDir, 'cookies.txt') : ''
+    ].filter(Boolean);
+    return candidates.find((p) => fs.existsSync(p) && fs.statSync(p).size > 0) || null;
+}
 
-let sock = null;
-let baileys = null;
-let baileysLogger = null;
+// Deteksi otomatis fitur yang didukung versi yt-dlp yang terpasang di Termux
+function detectYtDlpCapabilities() {
+    if (ytDlpCapsPromise) return ytDlpCapsPromise;
+
+    ytDlpCapsPromise = new Promise((resolve) => {
+        execFile(
+            ytDlpPath,
+            ['--help'],
+            { maxBuffer: 1024 * 1024 * 5, timeout: 15000, env: getEnvWithNode() },
+            (err, stdout, stderr) => {
+                if (err && err.code === 'ENOENT') {
+                    console.warn('[Diagnostik] yt-dlp tidak ditemukan! Install dengan: pip install -U yt-dlp');
+                    return resolve({
+                        installed: false,
+                        supportsJsRuntimes: false,
+                        supportsRemoteComponents: false
+                    });
+                }
+
+                const helpText = `${stdout || ''}\n${stderr || ''}`;
+                const caps = {
+                    installed: true,
+                    supportsJsRuntimes: helpText.includes('--js-runtimes'),
+                    supportsRemoteComponents: helpText.includes('--remote-components')
+                };
+                resolve(caps);
+            }
+        );
+    });
+
+    return ytDlpCapsPromise;
+}
+
+function logEnvironmentDiagnostics() {
+    execFile(ytDlpPath, ['--version'], { timeout: 10000, env: getEnvWithNode() }, (err, stdout) => {
+        if (err) {
+            console.warn('[Diagnostik] yt-dlp belum tersedia / gagal dijalankan:', err.message);
+        } else {
+            console.log(`[Diagnostik] yt-dlp versi: ${(stdout || '').trim()} (${ytDlpPath})`);
+        }
+    });
+
+    execFile(ffmpegPath, ['-version'], { timeout: 10000, env: getEnvWithNode() }, (err, stdout) => {
+        if (err) {
+            console.warn('[Diagnostik] ffmpeg belum tersedia! Install dengan: pkg install ffmpeg');
+        } else {
+            const firstLine = (stdout || '').split('\n')[0] || 'terpasang';
+            console.log(`[Diagnostik] ${firstLine.trim()}`);
+        }
+    });
+
+    const cookieFile = getCookiesFilePath();
+    if (cookieFile) {
+        console.log(`[Diagnostik] Menggunakan cookies: ${cookieFile}`);
+    }
+}
+
+function cleanExtractedUrl(rawUrl) {
+    return String(rawUrl || '').trim().replace(/[),.!?;:\]}]+$/, '');
+}
 
 function isSafePublicUrl(rawUrl) {
     try {
@@ -127,6 +206,15 @@ function isSafePublicUrl(rawUrl) {
     }
 }
 
+function isLoginOrChallengeUrl(rawUrl) {
+    try {
+        const u = new URL(rawUrl);
+        return /\/(accounts\/login|login\.php|login\/|checkpoint|challenge|consent)/i.test(u.pathname);
+    } catch {
+        return false;
+    }
+}
+
 function getCleanHostname(rawUrl) {
     try {
         return new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, '');
@@ -137,12 +225,12 @@ function getCleanHostname(rawUrl) {
 
 function isYoutubeUrl(rawUrl) {
     const h = getCleanHostname(rawUrl);
-    return h === 'youtube.com' || h === 'm.youtube.com' || h === 'music.youtube.com' || h === 'youtu.be';
+    return h === 'youtube.com' || h.endsWith('.youtube.com') || h === 'youtu.be';
 }
 
 function isInstagramUrl(rawUrl) {
     const h = getCleanHostname(rawUrl);
-    return h === 'instagram.com' || h === 'instagr.am';
+    return h === 'instagram.com' || h.endsWith('.instagram.com') || h === 'instagr.am';
 }
 
 function isTikTokUrl(rawUrl) {
@@ -163,7 +251,15 @@ function isFacebookUrl(rawUrl) {
 
 function isTwitterUrl(rawUrl) {
     const h = getCleanHostname(rawUrl);
-    return h === 'x.com' || h === 'twitter.com' || h === 'mobile.twitter.com' || h === 't.co';
+    return (
+        h === 'x.com' ||
+        h === 'twitter.com' ||
+        h === 'mobile.twitter.com' ||
+        h === 'vxtwitter.com' ||
+        h === 'fxtwitter.com' ||
+        h === 'fixupx.com' ||
+        h === 't.co'
+    );
 }
 
 function isThreadsUrl(rawUrl) {
@@ -179,44 +275,79 @@ function safeUnlink(filePath) {
     }
 }
 
-// Memastikan video berformat MP4 (H.264 + AAC + yuv420p) agar tidak melempar "Error: t" di WhatsApp Web
+async function resolveRedirectSafe(rawUrl) {
+    try {
+        const res = await fetch(rawUrl, {
+            redirect: 'follow',
+            signal: AbortSignal.timeout(15000),
+            headers: { 'User-Agent': USER_AGENT }
+        });
+        const finalUrl = res.url;
+        if (res.body) await res.body.cancel();
+        if (finalUrl && isSafePublicUrl(finalUrl) && !isLoginOrChallengeUrl(finalUrl)) {
+            return finalUrl;
+        }
+    } catch {}
+    return rawUrl;
+}
+
+// Memastikan video berformat MP4 (H.264 + AAC + yuv420p) agar kompatibel di semua perangkat WhatsApp
 function ensureWhatsAppCompatibleVideo(inputPath) {
     return new Promise((resolve) => {
-        execFile(ffmpegPath, ['-i', inputPath], (err, stdout, stderr) => {
-            const info = (stderr || '') + (stdout || '');
-            const isH264 = /Video:\s*h264/i.test(info);
-            const isYuv420p = /yuv420p/i.test(info);
-            const isMp4Ext = inputPath.toLowerCase().endsWith('.mp4');
-
-            if (isH264 && isYuv420p && isMp4Ext) {
+        execFile(ffmpegPath, ['-i', inputPath], { timeout: 30000 }, (err, stdout, stderr) => {
+            if (err && err.code === 'ENOENT') {
                 return resolve(inputPath);
             }
 
-            console.log('[FFmpeg] Mengonversi codec video ke H.264 agar kompatibel dengan WhatsApp...');
+            const info = (stderr || '') + (stdout || '');
+            const isH264 = /Video:\s*h264/i.test(info);
+            const isYuv420p = /yuv420p/i.test(info);
+            const hasAudio = /Audio:/i.test(info);
+            const isAac = !hasAudio || /Audio:\s*aac/i.test(info);
+            const isMp4Ext = inputPath.toLowerCase().endsWith('.mp4');
+
+            if (isH264 && isYuv420p && isAac && isMp4Ext) {
+                return resolve(inputPath);
+            }
+
+            console.log('[FFmpeg] Mengonversi video ke MP4 (H.264 + AAC) agar kompatibel dengan WhatsApp...');
             const outputPath = path.join(
                 tempDir,
                 `wa_h264_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.mp4`
             );
 
-            const args = [
-                '-y',
-                '-i', inputPath,
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-crf', '26',
-                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-movflags', '+faststart',
-                outputPath
-            ];
+            // Jika video sudah H.264 + yuv420p dan hanya audio yang perlu diubah ke AAC, copy video agar cepat
+            const args =
+                isH264 && isYuv420p
+                    ? [
+                        '-y',
+                        '-i', inputPath,
+                        '-c:v', 'copy',
+                        '-c:a', 'aac',
+                        '-b:a', '128k',
+                        '-movflags', '+faststart',
+                        outputPath
+                    ]
+                    : [
+                        '-y',
+                        '-i', inputPath,
+                        '-c:v', 'libx264',
+                        '-preset', 'ultrafast',
+                        '-crf', '26',
+                        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                        '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac',
+                        '-b:a', '128k',
+                        '-movflags', '+faststart',
+                        outputPath
+                    ];
 
-            execFile(ffmpegPath, args, { timeout: 120000 }, (convErr) => {
-                if (!convErr && fs.existsSync(outputPath)) {
+            execFile(ffmpegPath, args, { timeout: 180000 }, (convErr) => {
+                if (!convErr && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
                     safeUnlink(inputPath);
                     resolve(outputPath);
                 } else {
+                    safeUnlink(outputPath);
                     resolve(inputPath);
                 }
             });
@@ -363,20 +494,12 @@ function parseEmbedHtmlForMedia(html) {
 
 async function extractInstagramMedia(rawUrl) {
     let targetUrl = rawUrl;
-    if (/\/share\//i.test(rawUrl)) {
-        try {
-            const redirRes = await fetch(rawUrl, {
-                redirect: 'follow',
-                signal: AbortSignal.timeout(15000),
-                headers: { 'User-Agent': USER_AGENT }
-            });
-            targetUrl = redirRes.url;
-            if (redirRes.body) await redirRes.body.cancel();
-        } catch {}
+    if (/\/share\//i.test(rawUrl) || getCleanHostname(rawUrl) === 'instagr.am') {
+        targetUrl = await resolveRedirectSafe(rawUrl);
     }
 
     const match = targetUrl.match(/instagram\.com\/(?:[^/]+\/)?(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i);
-    if (!match) return [];
+    if (!match) return { targetUrl, items: [] };
     const shortcode = match[1];
 
     try {
@@ -407,8 +530,8 @@ async function extractInstagramMedia(rawUrl) {
             const media = json?.data?.shortcode_media || json?.data?.xdt_shortcode_media;
             const items = parseInstagramShortcodeMedia(media);
             if (items.length > 0) {
-                console.log(`[IG] Berhasil mengekstrak ${items.length} slide via GraphQL.`);
-                return items;
+                console.log(`[IG] Berhasil mengekstrak ${items.length} media via GraphQL.`);
+                return { targetUrl, items };
             }
         }
     } catch {}
@@ -425,14 +548,14 @@ async function extractInstagramMedia(rawUrl) {
                 const html = await embedRes.text();
                 const items = parseEmbedHtmlForMedia(html);
                 if (items.length > 0) {
-                    console.log(`[IG] Berhasil mengekstrak ${items.length} slide via Embed.`);
-                    return items;
+                    console.log(`[IG] Berhasil mengekstrak ${items.length} media via Embed.`);
+                    return { targetUrl, items };
                 }
             }
         } catch {}
     }
 
-    return [];
+    return { targetUrl, items: [] };
 }
 
 async function extractTikTokMedia(rawUrl) {
@@ -475,18 +598,10 @@ async function extractTikTokMedia(rawUrl) {
 async function extractTwitterMedia(rawUrl) {
     let targetUrl = rawUrl;
     if (getCleanHostname(rawUrl) === 't.co') {
-        try {
-            const redir = await fetch(rawUrl, {
-                redirect: 'follow',
-                signal: AbortSignal.timeout(15000),
-                headers: { 'User-Agent': USER_AGENT }
-            });
-            targetUrl = redir.url;
-            if (redir.body) await redir.body.cancel();
-        } catch {}
+        targetUrl = await resolveRedirectSafe(rawUrl);
     }
 
-    const match = targetUrl.match(/(?:twitter\.com|x\.com)\/(?:[^/]+)\/status\/(\d+)/i);
+    const match = targetUrl.match(/(?:twitter\.com|x\.com|vxtwitter\.com|fxtwitter\.com|fixupx\.com)\/(?:[^/]+)\/status\/(\d+)/i);
     if (!match) return [];
     const statusId = match[1];
 
@@ -587,7 +702,7 @@ async function inspectUrlSafe(url) {
         });
 
         if (!res.ok) return { type: 'unknown', directUrl: url, ogImageUrl: null };
-        if (!isSafePublicUrl(res.url)) {
+        if (!isSafePublicUrl(res.url) || isLoginOrChallengeUrl(res.url)) {
             if (res.body) await res.body.cancel();
             return { type: 'unknown', directUrl: url, ogImageUrl: null };
         }
@@ -620,85 +735,210 @@ async function inspectUrlSafe(url) {
     }
 }
 
-function runYtDlpProcess(url, mode, allowPlaylist, extraArgs = []) {
+function collectValidDownloadedFiles(fileId) {
+    const ignoredExts = new Set(['.part', '.ytdl', '.tmp', '.temp', '.json', '.description', '.vtt', '.srt']);
+    return fs
+        .readdirSync(tempDir)
+        .filter((file) => {
+            if (!file.startsWith(fileId)) return false;
+            const ext = path.extname(file).toLowerCase();
+            if (ignoredExts.has(ext) || file.endsWith('.part')) return false;
+            const fullPath = path.join(tempDir, file);
+            try {
+                return fs.statSync(fullPath).size > 0;
+            } catch {
+                return false;
+            }
+        })
+        .sort()
+        .map((file) => path.join(tempDir, file));
+}
+
+function cleanupFileIdArtifacts(fileId) {
+    for (const file of fs.readdirSync(tempDir)) {
+        if (file.startsWith(fileId)) {
+            safeUnlink(path.join(tempDir, file));
+        }
+    }
+}
+
+function runYtDlpProcess(url, mode, allowPlaylist, options = {}) {
+    const {
+        extraArgs = [],
+        simpleFormat = false,
+        useJsRuntime = false,
+        useRemoteComponents = false,
+        skipAudioConvert = false,
+        applyMaxFilesize = true
+    } = options;
+
     return new Promise((resolve, reject) => {
         const fileId = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const outputTemplate = path.join(tempDir, `${fileId}_%(autonumber)s.%(ext)s`);
 
-        const videoFormat =
-            'bestvideo[vcodec^=avc1][height<=720]+bestaudio[ext=m4a]/' +
-            'best[vcodec^=avc1][ext=mp4][height<=720]/' +
-            'best[ext=mp4][filesize<95M]/' +
-            'bestvideo[height<=720]+bestaudio/' +
-            'best';
-
-        const playlistFlag = allowPlaylist ? '--yes-playlist' : '--no-playlist';
+        const videoFormat = simpleFormat
+            ? 'best[ext=mp4]/bestvideo+bestaudio/best'
+            : 'bestvideo[vcodec^=avc1][height<=720]+bestaudio[ext=m4a]/' +
+              'best[vcodec^=avc1][ext=mp4][height<=720]/' +
+              'best[ext=mp4][height<=720]/' +
+              'bestvideo[height<=720]+bestaudio/' +
+              'best[ext=mp4]/' +
+              'best';
 
         const commonFlags = [
-            '--js-runtimes', 'node',
-            '--remote-components', 'ejs:github',
-            '--ffmpeg-location', ffmpegPath,
-            playlistFlag,
-            '--max-filesize', '100M',
-            ...extraArgs,
-            '-o', outputTemplate,
-            url
+            '--no-warnings',
+            '--geo-bypass',
+            '--retries', '3',
+            '--fragment-retries', '3',
+            '--socket-timeout', '25',
+            '--ffmpeg-location', ffmpegPath
         ];
 
-        const args = mode === 'audio'
-            ? [
-                '-f', 'bestaudio/best',
-                '-x',
-                '--audio-format', 'mp3',
-                '--audio-quality', '0',
-                ...commonFlags
-            ]
-            : [
-                '-f', videoFormat,
-                '-S', 'vcodec:h264,res:720,acodec:m4a',
-                '--merge-output-format', 'mp4',
-                ...commonFlags
-            ];
+        if (allowPlaylist) {
+            commonFlags.push('--yes-playlist', '--playlist-end', '10');
+        } else {
+            commonFlags.push('--no-playlist');
+        }
 
-        const nodeDir = path.dirname(process.execPath);
-        const envWithNode = {
-            ...process.env,
-            PATH: `${nodeDir}${path.delimiter}${process.env.PATH || ''}`
-        };
+        if (applyMaxFilesize) {
+            commonFlags.push('--max-filesize', '100M');
+        }
+
+        if (useJsRuntime) {
+            commonFlags.push('--js-runtimes', 'node');
+        }
+
+        if (useRemoteComponents) {
+            commonFlags.push('--remote-components', 'ejs:github');
+        }
+
+        const cookieFile = getCookiesFilePath();
+        if (cookieFile) {
+            commonFlags.push('--cookies', cookieFile);
+        }
+
+        commonFlags.push(...extraArgs, '-o', outputTemplate, url);
+
+        let args;
+        if (mode === 'audio') {
+            if (skipAudioConvert) {
+                args = ['-f', 'bestaudio[ext=m4a]/bestaudio/best', ...commonFlags];
+            } else {
+                args = [
+                    '-f', 'bestaudio/best',
+                    '-x',
+                    '--audio-format', 'mp3',
+                    '--audio-quality', '0',
+                    ...commonFlags
+                ];
+            }
+        } else {
+            args = ['-f', videoFormat];
+            if (!simpleFormat) {
+                args.push('-S', 'vcodec:h264,res:720,acodec:m4a');
+            }
+            args.push('--merge-output-format', 'mp4', ...commonFlags);
+        }
 
         execFile(
             ytDlpPath,
             args,
-            { maxBuffer: 1024 * 1024 * 100, timeout: 150000, env: envWithNode },
+            { maxBuffer: 1024 * 1024 * 100, timeout: 180000, env: getEnvWithNode() },
             (error, stdout, stderr) => {
-                const downloadedFiles = fs
-                    .readdirSync(tempDir)
-                    .filter((file) => file.startsWith(fileId))
-                    .sort()
-                    .map((file) => path.join(tempDir, file));
+                const downloadedFiles = collectValidDownloadedFiles(fileId);
 
                 if (downloadedFiles.length === 0) {
-                    return reject(new Error(stderr || (error ? error.message : 'File hasil unduhan tidak ditemukan.')));
+                    cleanupFileIdArtifacts(fileId);
+                    const rawMsg = (stderr || stdout || (error ? error.message : '') || 'File hasil unduhan tidak ditemukan.').trim();
+                    return reject(new Error(rawMsg));
                 }
 
-                resolve(downloadedFiles);
+                // Cek ukuran file agar tidak mengirim file > 100MB ke WA
+                const validFiles = [];
+                for (const fp of downloadedFiles) {
+                    if (fs.statSync(fp).size > MAX_DOWNLOAD_BYTES) {
+                        safeUnlink(fp);
+                    } else {
+                        validFiles.push(fp);
+                    }
+                }
+
+                if (validFiles.length === 0) {
+                    cleanupFileIdArtifacts(fileId);
+                    return reject(new Error('File terlalu besar (maks 100 MB).'));
+                }
+
+                resolve(validFiles);
             }
         );
     });
 }
 
 async function downloadWithYtDlp(url, mode = 'video', allowPlaylist = false) {
-    try {
-        return await runYtDlpProcess(url, mode, allowPlaylist);
-    } catch (firstErr) {
-        if (isYoutubeUrl(url)) {
-            console.warn('[YouTube] Percobaan pertama gagal, mencoba ulang dengan player_client alternatif...');
-            return await runYtDlpProcess(url, mode, allowPlaylist, [
-                '--extractor-args', 'youtube:player_client=android_vr,tv,mweb'
-            ]);
-        }
-        throw firstErr;
+    const caps = await detectYtDlpCapabilities();
+    if (!caps.installed) {
+        throw new Error('yt-dlp tidak ditemukan di Termux. Install dengan: pip install -U yt-dlp');
     }
+
+    const strategies = isYoutubeUrl(url)
+        ? [
+            {
+                label: 'YouTube default',
+                options: {
+                    useJsRuntime: caps.supportsJsRuntimes,
+                    useRemoteComponents: caps.supportsRemoteComponents
+                }
+            },
+            {
+                label: 'YouTube client android_vr/android/ios',
+                options: {
+                    extraArgs: ['--extractor-args', 'youtube:player_client=android_vr,android,ios']
+                }
+            },
+            {
+                label: 'YouTube client tv/web_embedded/mweb',
+                options: {
+                    useJsRuntime: caps.supportsJsRuntimes,
+                    extraArgs: ['--extractor-args', 'youtube:player_client=tv,web_embedded,mweb']
+                }
+            },
+            {
+                label: 'YouTube format sederhana (fallback tanpa konversi berat)',
+                options: {
+                    simpleFormat: true,
+                    skipAudioConvert: mode === 'audio',
+                    applyMaxFilesize: false,
+                    extraArgs: ['--extractor-args', 'youtube:player_client=android_vr,tv,web']
+                }
+            }
+        ]
+        : [
+            {
+                label: 'yt-dlp standar',
+                options: {}
+            },
+            {
+                label: 'yt-dlp format sederhana',
+                options: {
+                    simpleFormat: true,
+                    applyMaxFilesize: false
+                }
+            }
+        ];
+
+    let lastErr = null;
+    for (let i = 0; i < strategies.length; i++) {
+        const { label, options } = strategies[i];
+        try {
+            return await runYtDlpProcess(url, mode, allowPlaylist, options);
+        } catch (err) {
+            lastErr = err;
+            const brief = String(err.message || err).split('\n').slice(-2).join(' | ');
+            console.warn(`[yt-dlp] Gagal (${label}): ${brief}`);
+        }
+    }
+
+    throw lastErr || new Error('Gagal mengunduh media melalui yt-dlp.');
 }
 
 function setYoutubeSession(chatId, url) {
@@ -720,6 +960,26 @@ function clearYoutubeSession(chatId) {
     }
 }
 
+function formatFriendlyError(err) {
+    const msg = String(err?.message || err || '');
+
+    if (/yt-dlp tidak ditemukan|ENOENT/i.test(msg)) {
+        return 'Gagal mengunduh media: *yt-dlp* belum terpasang di Termux. Jalankan `pip install -U yt-dlp`.';
+    }
+    if (/Sign in to confirm|not a bot|cookies/i.test(msg)) {
+        return 'YouTube memblokir unduhan (verifikasi bot). Simpan file *cookies.txt* di folder bot lalu coba lagi.';
+    }
+    if (/Private video|Video unavailable|login required|This content isn't available/i.test(msg)) {
+        return 'Media tidak tersedia, sudah dihapus, atau berasal dari akun private.';
+    }
+    if (/File terlalu besar|larger than max-filesize/i.test(msg)) {
+        return 'Gagal mengunduh media karena ukuran file melebihi batas maksimal 100 MB.';
+    }
+    if (/no such option|Unsupported URL/i.test(msg)) {
+        return 'Link tidak didukung atau *yt-dlp* perlu diperbarui (`pip install -U yt-dlp`).';
+    }
+    return 'Gagal mengunduh media. Pastikan link bersifat publik, valid, dan bukan akun private.';
+}
 
 // ---------------------------------------------------------------------------
 // Pengiriman pesan (Baileys)
@@ -855,12 +1115,24 @@ async function sendVideoFileFromDisk(jid, rawFilePath, quoted) {
 
 async function sendAudioFileFromDisk(jid, filePath, quoted) {
     const opts = quoted ? { quoted } : undefined;
+    const ext = path.extname(filePath).toLowerCase() || '.mp3';
+    const mimeMap = {
+        '.mp3': 'audio/mpeg',
+        '.m4a': 'audio/mp4',
+        '.mp4': 'audio/mp4',
+        '.ogg': 'audio/ogg',
+        '.opus': 'audio/ogg',
+        '.wav': 'audio/wav',
+        '.webm': 'audio/webm'
+    };
+    const mimetype = mimeMap[ext] || 'audio/mpeg';
+
     try {
-        await sock.sendMessage(jid, { audio: { url: filePath }, mimetype: 'audio/mpeg' }, opts);
+        await sock.sendMessage(jid, { audio: { url: filePath }, mimetype }, opts);
     } catch {
         await sock.sendMessage(
             jid,
-            { document: { url: filePath }, mimetype: 'audio/mpeg', fileName: `audio_${Date.now()}.mp3` },
+            { document: { url: filePath }, mimetype, fileName: `audio_${Date.now()}${ext}` },
             opts
         );
     }
@@ -943,7 +1215,6 @@ async function downloadAndSendViaYtDlp(jid, url, mode = 'video', allowPlaylist =
         for (const filePath of filePaths) safeUnlink(filePath);
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Penanganan pesan masuk
@@ -1038,12 +1309,10 @@ async function handleMessage(msg) {
             const isReplyToBot = botJid && contextInfo?.participant?.includes(botJid);
             const prefixMatch = text.match(/^([.!\/]?(ai|agy)\b\s*)/i);
 
-            // Di grup: proses jika bot di-mention, me-reply pesan bot, ada awalan .ai/.agy, atau jika AI_GROUP_ALL=1
             if (isGroup && process.env.AI_GROUP_ALL !== '1' && !isMentioned && !isReplyToBot && !prefixMatch) {
                 return;
             }
 
-            // Bersihkan prefix jika ada (misal: ".ai halo" -> "halo")
             let promptText = text;
             if (prefixMatch) {
                 promptText = text.slice(prefixMatch[0].length).trim();
@@ -1082,7 +1351,7 @@ async function handleMessage(msg) {
             return;
         }
 
-        const url = urlMatch[0];
+        const url = cleanExtractedUrl(urlMatch[0]);
         if (!isSafePublicUrl(url)) throw new Error('URL tidak valid.');
 
         if (isYoutubeUrl(url)) {
@@ -1103,20 +1372,31 @@ async function handleMessage(msg) {
         await react(msg, '⏳');
 
         if (isInstagramUrl(url)) {
-            const items = await extractInstagramMedia(url);
+            const { targetUrl, items } = await extractInstagramMedia(url);
             if (items.length > 0) {
-                await sendExtractedMediaItems(jid, items, 'https://www.instagram.com/', makeStickerFlag, msg);
-                await react(msg, '✅');
-                return;
+                try {
+                    await sendExtractedMediaItems(jid, items, 'https://www.instagram.com/', makeStickerFlag, msg);
+                    await react(msg, '✅');
+                    return;
+                } catch (err) {
+                    console.warn('[IG] Pengiriman dari ekstraktor gagal, beralih ke yt-dlp:', err.message);
+                }
             }
+            await downloadAndSendViaYtDlp(jid, targetUrl || url, 'video', true, msg);
+            await react(msg, '✅');
+            return;
         }
 
         if (isTikTokUrl(url)) {
             const items = await extractTikTokMedia(url);
             if (items.length > 0) {
-                await sendExtractedMediaItems(jid, items, 'https://www.tiktok.com/', makeStickerFlag, msg);
-                await react(msg, '✅');
-                return;
+                try {
+                    await sendExtractedMediaItems(jid, items, 'https://www.tiktok.com/', makeStickerFlag, msg);
+                    await react(msg, '✅');
+                    return;
+                } catch (err) {
+                    console.warn('[TikTok] Pengiriman via TikWM gagal, beralih ke yt-dlp:', err.message);
+                }
             }
             await downloadAndSendViaYtDlp(jid, url, 'video', true, msg);
             await react(msg, '✅');
@@ -1126,9 +1406,13 @@ async function handleMessage(msg) {
         if (isTwitterUrl(url)) {
             const items = await extractTwitterMedia(url);
             if (items.length > 0) {
-                await sendExtractedMediaItems(jid, items, 'https://x.com/', makeStickerFlag, msg);
-                await react(msg, '✅');
-                return;
+                try {
+                    await sendExtractedMediaItems(jid, items, 'https://x.com/', makeStickerFlag, msg);
+                    await react(msg, '✅');
+                    return;
+                } catch (err) {
+                    console.warn('[X/Twitter] Pengiriman via API gagal, beralih ke yt-dlp:', err.message);
+                }
             }
             await downloadAndSendViaYtDlp(jid, url, 'video', true, msg);
             await react(msg, '✅');
@@ -1138,16 +1422,35 @@ async function handleMessage(msg) {
         if (isThreadsUrl(url)) {
             const items = await extractThreadsMedia(url);
             if (items.length > 0) {
-                await sendExtractedMediaItems(jid, items, 'https://www.threads.net/', makeStickerFlag, msg);
-                await react(msg, '✅');
-                return;
+                try {
+                    await sendExtractedMediaItems(jid, items, 'https://www.threads.net/', makeStickerFlag, msg);
+                    await react(msg, '✅');
+                    return;
+                } catch (err) {
+                    console.warn('[Threads] Pengiriman via Embed gagal, beralih ke yt-dlp:', err.message);
+                }
             }
-        }
-
-        if (isFacebookUrl(url)) {
             await downloadAndSendViaYtDlp(jid, url, 'video', true, msg);
             await react(msg, '✅');
             return;
+        }
+
+        if (isFacebookUrl(url)) {
+            const resolvedFbUrl = /\/share\/|fb\.watch/i.test(url) ? await resolveRedirectSafe(url) : url;
+            try {
+                await downloadAndSendViaYtDlp(jid, resolvedFbUrl, 'video', true, msg);
+                await react(msg, '✅');
+                return;
+            } catch (fbErr) {
+                const fbInfo = await inspectUrlSafe(resolvedFbUrl);
+                if (fbInfo.ogImageUrl) {
+                    const { buffer, contentType } = await fetchImageBuffer(fbInfo.ogImageUrl, resolvedFbUrl);
+                    await sendImageBuffer(jid, buffer, contentType, makeStickerFlag, msg);
+                    await react(msg, '✅');
+                    return;
+                }
+                throw fbErr;
+            }
         }
 
         const info = await inspectUrlSafe(url);
@@ -1200,11 +1503,7 @@ async function handleMessage(msg) {
     } catch (error) {
         console.error('Terjadi kesalahan:', error.message || error);
         await react(msg, '❌');
-        await sendText(
-            jid,
-            'Gagal mengunduh media. Pastikan link bersifat publik, valid, dan bukan akun private.',
-            msg
-        ).catch(() => {});
+        await sendText(jid, formatFriendlyError(error), msg).catch(() => {});
     }
 }
 
@@ -1314,6 +1613,7 @@ async function startSocket() {
 
         if (connection === 'open') {
             console.log('Bot WA (All-in-One Downloader: IG, TikTok, FB, X, Threads, YouTube & Stiker) aktif!');
+            logEnvironmentDiagnostics();
         }
 
         if (connection === 'close') {
