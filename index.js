@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const { pipeline } = require('stream/promises');
 const { Readable } = require('stream');
 const qrcode = require('qrcode-terminal');
@@ -28,6 +28,63 @@ const ytDlpCandidates = [
     '/usr/bin/yt-dlp'
 ];
 const ytDlpPath = ytDlpCandidates.find((p) => p && fs.existsSync(p)) || 'yt-dlp';
+
+const agyCandidates = [
+    path.join(termuxBinDir, 'agy'),
+    homeDir ? path.join(homeDir, '.local', 'bin', 'agy') : '',
+    '/usr/local/bin/agy',
+    '/usr/bin/agy'
+];
+const agyPath = process.env.AGY_PATH || agyCandidates.find((p) => p && fs.existsSync(p)) || 'agy';
+
+// Konversi format Markdown standar AI ke format WhatsApp
+function formatKeWhatsApp(teks) {
+    if (!teks) return '';
+    return teks
+        .replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '') // Hapus ANSI escape sequences
+        .replace(/^#{1,6}\s*(.+)$/gm, '*$1*')   // Markdown header -> *BOLD*
+        .replace(/\*\*(.+?)\*\*/g, '*$1*')     // **bold** -> *bold*
+        .replace(/~~(.+?)~~/g, '~$1~')         // ~~strikethrough~~ -> ~strikethrough~
+        .trim();
+}
+
+// Menjalankan perintah Antigravity (agy -p "<pertanyaan>") secara headless
+function tanyaAgy(pertanyaan, timeoutMs = 120000) {
+    return new Promise((resolve, reject) => {
+        const proses = spawn(agyPath, ['-p', pertanyaan]);
+        let output = '';
+        let errorOutput = '';
+
+        const timer = setTimeout(() => {
+            try {
+                proses.kill();
+            } catch {}
+            reject(new Error('Waktu tunggu balasan AI habis (Timeout 120 detik).'));
+        }, timeoutMs);
+
+        proses.stdout.on('data', (data) => {
+            output += data.toString();
+        });
+
+        proses.stderr.on('data', (data) => {
+            errorOutput += data.toString();
+        });
+
+        proses.on('close', (code) => {
+            clearTimeout(timer);
+            if (code === 0) {
+                resolve(output.trim());
+            } else {
+                reject(new Error(errorOutput.trim() || `Proses agy keluar dengan kode ${code}`));
+            }
+        });
+
+        proses.on('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+    });
+}
 
 const tempDir = path.join(__dirname, 'temp_downloads');
 const authDir = path.join(__dirname, 'auth_info');
@@ -968,7 +1025,62 @@ async function handleMessage(msg) {
         }
 
         const urlMatch = text.match(/https?:\/\/[^\s"'<>]+/i);
-        if (!urlMatch) return;
+        if (!urlMatch) {
+            // ===============================================================
+            // LOGIKA CHAT BIASA (NON-LINK) -> DITERUSKAN KE ANTIGRAVITY (AGY)
+            // ===============================================================
+            if (!text || text.length === 0) return;
+
+            const isGroup = jid.endsWith('@g.us');
+            const botJid = sock?.user?.id ? sock.user.id.split(':')[0] : '';
+            const contextInfo = content.extendedTextMessage?.contextInfo;
+            const isMentioned = botJid && contextInfo?.mentionedJid?.some((m) => m.includes(botJid));
+            const isReplyToBot = botJid && contextInfo?.participant?.includes(botJid);
+            const prefixMatch = text.match(/^([.!\/]?(ai|agy)\b\s*)/i);
+
+            // Di grup: proses jika bot di-mention, me-reply pesan bot, ada awalan .ai/.agy, atau jika AI_GROUP_ALL=1
+            if (isGroup && process.env.AI_GROUP_ALL !== '1' && !isMentioned && !isReplyToBot && !prefixMatch) {
+                return;
+            }
+
+            // Bersihkan prefix jika ada (misal: ".ai halo" -> "halo")
+            let promptText = text;
+            if (prefixMatch) {
+                promptText = text.slice(prefixMatch[0].length).trim();
+            }
+            if (!promptText) promptText = text;
+
+            console.log(`[AI agy] Pertanyaan dari ${jid}: "${promptText.slice(0, 50)}${promptText.length > 50 ? '...' : ''}"`);
+            await react(msg, '🤖');
+
+            try {
+                if (sock?.sendPresenceUpdate) {
+                    await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+                }
+
+                const balasan = await tanyaAgy(promptText);
+                if (balasan) {
+                    await sendText(jid, formatKeWhatsApp(balasan), msg);
+                    await react(msg, '✅');
+                } else {
+                    await sendText(jid, 'Maaf, AI tidak memberikan balasan.', msg);
+                    await react(msg, '⚠️');
+                }
+            } catch (aiErr) {
+                console.error('[AI agy] Gagal merespons:', aiErr.message || aiErr);
+                await react(msg, '❌');
+                await sendText(
+                    jid,
+                    `⚠️ Terjadi kesalahan saat memproses jawaban AI:\n_${aiErr.message || 'Gagal menjalankan perintah agy'}_`,
+                    msg
+                );
+            } finally {
+                if (sock?.sendPresenceUpdate) {
+                    await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+                }
+            }
+            return;
+        }
 
         const url = urlMatch[0];
         if (!isSafePublicUrl(url)) throw new Error('URL tidak valid.');

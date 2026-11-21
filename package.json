@@ -1,7 +1,7 @@
 {
   "name": "bot-wa-termux",
-  "version": "2.0.0",
-  "description": "WhatsApp Bot All-in-One Downloader (IG, TikTok, FB, X, Threads, YouTube) & Pembuat Stiker untuk Termux Android (Baileys, tanpa Chromium)",
+  "version": "2.1.0",
+  "description": "WhatsApp Bot All-in-One Downloader, Stiker Maker, & Antigravity (agy) AI Assistant untuk Termux Android (Baileys)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

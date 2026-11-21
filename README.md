@@ -24,10 +24,23 @@ bash start.sh
 ```
 
 ## Cara pakai
-- Kirim link IG / TikTok / FB / X / Threads -> bot mengirim medianya.
-- Tambahkan kata `stiker` di pesan berisi link gambar untuk menjadikannya stiker.
-- Kirim gambar / video / GIF -> bot membalas stiker.
-- Kirim link YouTube -> balas `1` (video) atau `2` (mp3). `0` untuk batal.
+- **Tanya AI (Antigravity agy):** Kirim pesan teks apa pun tanpa link di chat pribadi (DM), bot akan otomatis menjawab via `agy -p`.
+  - Di grup: tag/mention bot, reply pesan bot, atau gunakan awalan `.ai <pertanyaan>`.
+  - (Opsional) Ingin bot merespons semua chat di grup tanpa perlu di-tag? Jalankan dengan `AI_GROUP_ALL=1 node index.js`.
+- **Downloader:** Kirim link IG / TikTok / FB / X / Threads / YouTube -> bot otomatis mengunduh medianya.
+- **Stiker:** Kirim gambar / video / GIF -> bot membalas stiker. Tambahkan kata `stiker` di pesan berisi link gambar.
+- **YouTube:** Kirim link YouTube -> balas `1` (video) atau `2` (mp3). `0` untuk batal.
+
+## Pengaturan Antigravity (agy)
+1. Pastikan CLI `agy` sudah terpasang dan sudah login di Termux Anda:
+   ```bash
+   agy
+   ```
+2. Bot otomatis mendeteksi lokasi binary `agy` di sistem (`$PREFIX/bin/agy`, `~/.local/bin/agy`, atau PATH).
+3. Jika lokasi `agy` berada di path khusus, jalankan dengan:
+   ```bash
+   AGY_PATH=/path/ke/agy node index.js
+   ```
 
 ## Troubleshooting
 - Reset login: `npm run clean:session` lalu `node index.js`.
