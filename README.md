@@ -1,69 +1,36 @@
-# Bot WA All-in-One (Versi Termux Android)
+# Bot WA All-in-One (Termux Android, Baileys)
 
-Bot WhatsApp berbasis `whatsapp-web.js` untuk mengunduh media publik (Instagram, TikTok, Facebook, X/Twitter, Threads, YouTube) serta membuat stiker otomatis dari gambar/video/GIF. Sudah dioptimalkan khusus agar berjalan stabil menggunakan Chromium bawaan Termux Android.
+Bot WhatsApp untuk mengunduh media publik (Instagram, TikTok, Facebook, X/Twitter, Threads, YouTube) dan membuat stiker dari gambar/video/GIF. Versi ini memakai **Baileys** (koneksi WebSocket langsung), jadi **tidak butuh Chromium** dan jauh lebih hemat RAM di HP.
 
-## Struktur File
-- `index.js` — Kode utama bot dengan konfigurasi Puppeteer, Chromium, FFmpeg, dan `yt-dlp` khusus Termux.
-- `package.json` — Daftar dependensi Node.js dan perintah cepat (`npm start`).
-- `.npmrc` — Mencegah Puppeteer mengunduh Chromium versi PC (x86_64) saat `npm install`.
-- `.gitignore` — Mencegah folder rahasia (`.wwebjs_auth/`) dan folder besar (`node_modules/`) ikut ter-upload ke GitHub.
-- `install.sh` — Script instalasi otomatis semua paket yang dibutuhkan di Termux.
-- `start.sh` — Script untuk menjalankan bot dengan pengecekan internet, `termux-wake-lock`, pembersihan proses Chromium, dan *auto-restart*.
+## Instalasi
+```bash
+unzip bot-wa-termux.zip && cd bot-wa-termux
+bash install.sh
+```
 
----
+## Login pertama (kode pairing, tanpa scan QR)
+```bash
+node index.js
+```
+Masukkan nomor WhatsApp bot (contoh `6281234567890`, awalan `0` otomatis jadi `62`). Lalu di HP:
+**WhatsApp > Perangkat Tertaut > Tautkan Perangkat > Tautkan dengan nomor telepon saja**, dan masukkan kode 8 karakter yang tampil di Termux.
 
-## Cara Instalasi & Menjalankan di Termux
+Alternatif tanpa prompt: `WA_NUMBER=6281234567890 node index.js`.
+Alternatif QR (dipindai dari perangkat lain): `USE_QR=1 node index.js`.
 
-1. **Clone repositori dari GitHub:**
-   ```bash
-   pkg install git -y
-   git clone https://github.com/USERNAME_ANDA/NAMA_REPO_ANDA.git
-   cd NAMA_REPO_ANDA
-   ```
+Setelah berhasil login, hentikan dengan Ctrl+C lalu jalankan terus-menerus:
+```bash
+bash start.sh
+```
 
-2. **Jalankan installer otomatis:**
-   ```bash
-   bash install.sh
-   ```
+## Cara pakai
+- Kirim link IG / TikTok / FB / X / Threads -> bot mengirim medianya.
+- Tambahkan kata `stiker` di pesan berisi link gambar untuk menjadikannya stiker.
+- Kirim gambar / video / GIF -> bot membalas stiker.
+- Kirim link YouTube -> balas `1` (video) atau `2` (mp3). `0` untuk batal.
 
-3. **Jalankan Bot:**
-   - Dengan *auto-restart* & *wake-lock* (disarankan):
-     ```bash
-     bash start.sh
-     ```
-   - Atau jalankan langsung satu kali:
-     ```bash
-     npm start
-     ```
-   - Scan **QR Code** yang muncul di layar Termux lewat **WhatsApp > Perangkat Tertaut**.
-
----
-
-## Cara Upload Proyek Ini ke GitHub dari Termux
-
-1. Ekstrak file `.zip` lalu masuk ke foldernya:
-   ```bash
-   unzip bot-wa-termux.zip
-   cd bot-wa-termux
-   ```
-2. Inisialisasi Git dan kirim ke repositori GitHub Anda:
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit: Bot WA Termux ready"
-   git branch -M main
-   git remote add origin https://github.com/USERNAME_ANDA/NAMA_REPO_ANDA.git
-   git push -u origin main
-   ```
-
----
-
-## Troubleshooting Cepat
-- **Ingin reset login / QR Code tidak muncul:**
-  ```bash
-  npm run clean:session
-  ```
-- **Ingin melihat log detail Chromium saat terjadi error:**
-  ```bash
-  DEBUG_CHROME=1 node index.js
-  ```
+## Troubleshooting
+- Reset login: `npm run clean:session` lalu `node index.js`.
+- Log detail koneksi: `DEBUG_BAILEYS=1 node index.js`.
+- Unduhan gagal: `pip install -U yt-dlp`.
+- Folder `auth_info/` berisi sesi login, jangan di-upload ke GitHub (sudah ada di `.gitignore`).

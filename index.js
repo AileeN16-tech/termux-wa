@@ -1,80 +1,27 @@
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const { execFile, execSync } = require('child_process');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+const { execFile } = require('child_process');
+const { pipeline } = require('stream/promises');
+const { Readable } = require('stream');
+const qrcode = require('qrcode-terminal');
+
+// ---------------------------------------------------------------------------
+// Bot WA All-in-One (Baileys) - tanpa Chromium, ringan untuk Termux Android
+// ---------------------------------------------------------------------------
 
 const termuxPrefix = process.env.PREFIX || '/data/data/com.termux/files/usr';
 const termuxBinDir = path.join(termuxPrefix, 'bin');
 const homeDir = process.env.HOME || '';
 
-let ffmpegPath = null;
-try {
-    const staticFfmpeg = require('ffmpeg-static');
-    if (staticFfmpeg && fs.existsSync(staticFfmpeg)) {
-        ffmpegPath = staticFfmpeg;
-    }
-} catch {}
-
-if (!ffmpegPath) {
-    const systemFfmpegCandidates = [
-        path.join(termuxBinDir, 'ffmpeg'),
-        '/usr/bin/ffmpeg',
-        '/usr/local/bin/ffmpeg'
-    ];
-    const foundFfmpeg = systemFfmpegCandidates.find((p) => fs.existsSync(p));
-    ffmpegPath = foundFfmpeg || 'ffmpeg';
-}
-
-// Prioritaskan path Chromium Termux Android murni terlebih dahulu
-const browserCandidates = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    path.join(termuxBinDir, 'chromium-browser'),
-    path.join(termuxBinDir, 'chromium'),
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/google-chrome',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
+const ffmpegCandidates = [
+    path.join(termuxBinDir, 'ffmpeg'),
+    '/usr/bin/ffmpeg',
+    '/usr/local/bin/ffmpeg'
 ];
+const ffmpegPath = ffmpegCandidates.find((p) => fs.existsSync(p)) || 'ffmpeg';
 
-let executablePath = browserCandidates.find((p) => p && fs.existsSync(p));
-
-if (!executablePath) {
-    try {
-        const whichBrowser = execSync(
-            'which chromium-browser || which chromium || which google-chrome-stable || which google-chrome || which chrome',
-            {
-                encoding: 'utf8',
-                stdio: ['pipe', 'pipe', 'ignore']
-            }
-        ).trim();
-        if (whichBrowser && fs.existsSync(whichBrowser)) {
-            executablePath = whichBrowser;
-        }
-    } catch {}
-}
-
-if (!executablePath) {
-    console.error('Error: Browser Chromium maupun Google Chrome tidak ditemukan.');
-    console.error('Jalankan di Termux: pkg install x11-repo -y && pkg install chromium -y');
-    process.exit(1);
-}
-
-console.log(`[Bot WA] Menggunakan browser: ${executablePath}`);
-
-const winGetYtDlp = path.join(
-    process.env.LOCALAPPDATA || '',
-    'Microsoft',
-    'WinGet',
-    'Links',
-    'yt-dlp.exe'
-);
 const ytDlpCandidates = [
-    winGetYtDlp,
     path.join(termuxBinDir, 'yt-dlp'),
     homeDir ? path.join(homeDir, '.local', 'bin', 'yt-dlp') : '',
     '/usr/local/bin/yt-dlp',
@@ -83,96 +30,23 @@ const ytDlpCandidates = [
 const ytDlpPath = ytDlpCandidates.find((p) => p && fs.existsSync(p)) || 'yt-dlp';
 
 const tempDir = path.join(__dirname, 'temp_downloads');
-if (!fs.existsSync(tempDir)) {
-    fs.mkdirSync(tempDir, { recursive: true });
-}
-
+const authDir = path.join(__dirname, 'auth_info');
+if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 for (const file of fs.readdirSync(tempDir)) {
     try {
         fs.unlinkSync(path.join(tempDir, file));
     } catch {}
 }
 
-// Bersihkan lock file Chromium (SingletonLock) yang tertinggal jika proses sebelumnya terhenti
-const authDir = path.join(__dirname, '.wwebjs_auth');
-if (fs.existsSync(authDir)) {
-    const cleanLocks = (dir) => {
-        try {
-            for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
-                const fullPath = path.join(dir, item.name);
-                if (item.isDirectory()) {
-                    cleanLocks(fullPath);
-                } else if (item.name.startsWith('Singleton')) {
-                    fs.unlinkSync(fullPath);
-                }
-            }
-        } catch {}
-    };
-    cleanLocks(authDir);
-}
-
 const pendingYoutubeChoices = new Map();
 const CHOICE_TIMEOUT_MS = 2 * 60 * 1000;
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 
-const isTermux = Boolean(process.env.TERMUX_VERSION) || fs.existsSync(termuxBinDir);
-
-const puppeteerArgs = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--disable-software-rasterizer',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-extensions',
-    '--disable-background-networking',
-    '--disable-sync',
-    '--metrics-recording-only',
-    '--mute-audio',
-    // Flag khusus Linux/Termux Android (Chromium 133+)
-    ...(process.platform === 'linux' || isTermux
-        ? [
-            '--disable-dbus',
-            '--disable-crash-reporter',
-            // Jalankan GPU & network service di dalam proses utama agar tidak crash
-            // saat Chromium meluncurkan proses anak di Android
-            '--in-process-gpu',
-            '--enable-features=NetworkServiceInProcess'
-        ]
-        : [])
-];
-
-// LD_PRELOAD (libtermux-exec.so) tidak boleh diwariskan ke proses anak Chromium,
-// kalau tidak muncul error "CANNOT LINK EXECUTABLE" lalu GPU/network service crash
-const chromeEnv = { ...process.env };
-delete chromeEnv.LD_PRELOAD;
-
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    ffmpegPath: ffmpegPath,
-    puppeteer: {
-        headless: true,
-        pipe: false,
-        timeout: 120000,
-        protocolTimeout: 120000,
-        dumpio: process.env.DEBUG_CHROME === '1',
-        executablePath: executablePath,
-        env: chromeEnv,
-        args: puppeteerArgs
-    }
-});
-
-client.on('qr', (qr) => {
-    console.log('Scan QR Code ini menggunakan WhatsApp di HP Anda:');
-    qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-    console.log('Bot WA (All-in-One Downloader: IG, TikTok, FB, X, Threads, YouTube & Stiker) aktif!');
-});
+let sock = null;
+let baileys = null;
+let baileysLogger = null;
 
 function isSafePublicUrl(rawUrl) {
     try {
@@ -291,112 +165,6 @@ function ensureWhatsAppCompatibleVideo(inputPath) {
             });
         });
     });
-}
-
-// Fallback otomatis ke dokumen jika WhatsApp menolak render video/gambar
-async function sendMediaSafe(chatId, media, options = {}) {
-    try {
-        await client.sendMessage(chatId, media, options);
-    } catch (err) {
-        if (!options.sendMediaAsDocument && !options.sendMediaAsSticker) {
-            console.warn('[WA] Pengiriman media standar gagal, mengirim ulang sebagai dokumen...');
-            await client.sendMessage(chatId, media, {
-                ...options,
-                sendMediaAsDocument: true
-            });
-        } else {
-            throw err;
-        }
-    }
-}
-
-async function sendVideoFileFromDisk(chatId, rawFilePath) {
-    let finalPath = rawFilePath;
-    try {
-        finalPath = await ensureWhatsAppCompatibleVideo(rawFilePath);
-        const fileSizeMB = fs.statSync(finalPath).size / (1024 * 1024);
-        const media = MessageMedia.fromFilePath(finalPath);
-        await sendMediaSafe(chatId, media, {
-            sendMediaAsDocument: fileSizeMB > 60
-        });
-    } finally {
-        safeUnlink(rawFilePath);
-        if (finalPath !== rawFilePath) {
-            safeUnlink(finalPath);
-        }
-    }
-}
-
-async function downloadUrlToTempFile(mediaUrl, referer = '', defaultExt = 'mp4') {
-    const headers = {
-        'User-Agent': USER_AGENT,
-        'Accept': '*/*'
-    };
-    if (referer) headers['Referer'] = referer;
-
-    const res = await fetch(mediaUrl, {
-        redirect: 'follow',
-        signal: AbortSignal.timeout(45000),
-        headers
-    });
-
-    if (!res.ok) {
-        throw new Error(`Gagal mengunduh stream media (${res.status})`);
-    }
-
-    const filePath = path.join(
-        tempDir,
-        `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.${defaultExt}`
-    );
-    const buffer = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(filePath, buffer);
-    return filePath;
-}
-
-async function fetchMediaAsMessageMedia(mediaUrl, referer = 'https://www.instagram.com/') {
-    const res = await fetch(mediaUrl, {
-        redirect: 'follow',
-        signal: AbortSignal.timeout(30000),
-        headers: {
-            'User-Agent': USER_AGENT,
-            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,video/*,*/*;q=0.8',
-            'Referer': referer
-        }
-    });
-
-    if (!res.ok) {
-        throw new Error(`Gagal mengunduh file media (${res.status})`);
-    }
-
-    const contentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
-    const arrayBuffer = await res.arrayBuffer();
-    const base64Data = Buffer.from(arrayBuffer).toString('base64');
-
-    let ext = 'jpg';
-    if (contentType.includes('video/mp4')) ext = 'mp4';
-    else if (contentType.includes('image/png')) ext = 'png';
-    else if (contentType.includes('image/webp')) ext = 'webp';
-
-    return new MessageMedia(contentType, base64Data, `media_${Date.now()}.${ext}`);
-}
-
-async function sendExtractedMediaItems(chatId, items, referer, makeSticker = false) {
-    for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        console.log(`Mengirim media ${i + 1}/${items.length} (${item.type})...`);
-
-        if (item.type === 'video') {
-            const tempVideo = await downloadUrlToTempFile(item.url, referer, 'mp4');
-            await sendVideoFileFromDisk(chatId, tempVideo);
-        } else {
-            const media = await fetchMediaAsMessageMedia(item.url, referer);
-            await sendMediaSafe(chatId, media, {
-                sendMediaAsSticker: makeSticker,
-                stickerName: 'Stiker Otomatis',
-                stickerAuthor: 'WA Bot'
-            });
-        }
-    }
 }
 
 function extractJsonStringLiteral(text, keyName) {
@@ -607,86 +375,6 @@ async function extractInstagramMedia(rawUrl) {
         } catch {}
     }
 
-    if (client.pupBrowser) {
-        let page = null;
-        try {
-            page = await client.pupBrowser.newPage();
-            await page.setUserAgent(USER_AGENT);
-            await page.goto(`https://www.instagram.com/p/${shortcode}/embed/captioned/`, {
-                waitUntil: 'networkidle2',
-                timeout: 30000
-            });
-
-            const htmlContent = await page.content();
-            const scriptItems = parseEmbedHtmlForMedia(htmlContent);
-            if (scriptItems.length > 0) {
-                console.log(`[IG] Berhasil mengekstrak ${scriptItems.length} slide via Puppeteer Script.`);
-                return scriptItems;
-            }
-
-            const collected = [];
-            const seenUrls = new Set();
-
-            for (let step = 0; step < 25; step++) {
-                const currentSlideMedia = await page.evaluate(() => {
-                    const found = [];
-                    document.querySelectorAll('.Embed video, .EmbedSidecar video, video').forEach((v) => {
-                        if (v.src && v.src.startsWith('http')) found.push({ type: 'video', url: v.src });
-                    });
-                    document.querySelectorAll('img.EmbeddedMediaImage, .EmbedSidecar img').forEach((img) => {
-                        let bestUrl = img.src;
-                        if (img.srcset) {
-                            const candidates = img.srcset
-                                .split(',')
-                                .map((s) => s.trim().split(/\s+/)[0])
-                                .filter(Boolean);
-                            if (candidates.length > 0) bestUrl = candidates[candidates.length - 1];
-                        }
-                        if (bestUrl && bestUrl.startsWith('http') && !bestUrl.includes('s150x150')) {
-                            found.push({ type: 'image', url: bestUrl });
-                        }
-                    });
-                    return found;
-                });
-
-                for (const item of currentSlideMedia) {
-                    if (!seenUrls.has(item.url)) {
-                        seenUrls.add(item.url);
-                        collected.push(item);
-                    }
-                }
-
-                const clickedNext = await page.evaluate(() => {
-                    const selectors = [
-                        'a.coreSpriteRightChevron',
-                        'button.coreSpriteRightChevron',
-                        '.coreSpriteRightChevron',
-                        'button[aria-label="Next"]',
-                        'button[aria-label="Berikutnya"]',
-                        '.RightChevron'
-                    ];
-                    for (const sel of selectors) {
-                        const btn = document.querySelector(sel);
-                        if (btn && btn.offsetParent !== null) {
-                            btn.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                });
-
-                if (!clickedNext) break;
-                await new Promise((r) => setTimeout(r, 550));
-            }
-
-            if (collected.length > 0) return collected;
-        } catch (err) {
-            console.warn('[IG] Puppeteer fallback gagal:', err.message);
-        } finally {
-            if (page) await page.close().catch(() => {});
-        }
-    }
-
     return [];
 }
 
@@ -827,120 +515,7 @@ async function extractThreadsMedia(rawUrl) {
         } catch {}
     }
 
-    if (client.pupBrowser) {
-        let page = null;
-        try {
-            page = await client.pupBrowser.newPage();
-            await page.setUserAgent(USER_AGENT);
-            const target = shortcode
-                ? `https://www.threads.net/@_/post/${shortcode}/embed/`
-                : rawUrl;
-
-            await page.goto(target, { waitUntil: 'networkidle2', timeout: 30000 });
-
-            const items = await page.evaluate(() => {
-                const found = [];
-                const seen = new Set();
-
-                document.querySelectorAll('video, video source').forEach((el) => {
-                    const src = el.src || el.getAttribute('src');
-                    if (src && src.startsWith('http') && !seen.has(src)) {
-                        seen.add(src);
-                        found.push({ type: 'video', url: src });
-                    }
-                });
-
-                document.querySelectorAll('picture img, .MediaContainer img, .SingleInnerMediaContainer img, article img').forEach((img) => {
-                    if (img.width > 120 || !img.width) {
-                        const src = img.src;
-                        if (
-                            src &&
-                            src.startsWith('http') &&
-                            !src.includes('s150x150') &&
-                            !src.includes('ProfilePic') &&
-                            !seen.has(src)
-                        ) {
-                            seen.add(src);
-                            found.push({ type: 'image', url: src });
-                        }
-                    }
-                });
-
-                return found;
-            });
-
-            if (items.length > 0) {
-                console.log(`[Threads] Menemukan ${items.length} media via Puppeteer.`);
-                return items;
-            }
-        } catch (err) {
-            console.warn('[Threads] Puppeteer fallback gagal:', err.message);
-        } finally {
-            if (page) await page.close().catch(() => {});
-        }
-    }
-
     return [];
-}
-
-async function extractFacebookMediaWithPuppeteer(rawUrl) {
-    if (!client.pupBrowser) return { resolvedUrl: rawUrl, items: [] };
-
-    let page = null;
-    try {
-        page = await client.pupBrowser.newPage();
-        await page.setUserAgent(USER_AGENT);
-        await page.goto(rawUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-
-        const resolvedUrl = page.url();
-        const html = await page.content();
-        const items = [];
-
-        const hdMatch =
-            html.match(/"browser_native_hd_url"\s*:\s*"([^"]+)"/) ||
-            html.match(/"playable_url_quality_hd"\s*:\s*"([^"]+)"/);
-        const sdMatch =
-            html.match(/"browser_native_sd_url"\s*:\s*"([^"]+)"/) ||
-            html.match(/"playable_url"\s*:\s*"([^"]+)"/);
-
-        const rawVideoJsonUrl = hdMatch?.[1] || sdMatch?.[1];
-        if (rawVideoJsonUrl) {
-            const cleanVideoUrl = JSON.parse(`"${rawVideoJsonUrl}"`);
-            if (cleanVideoUrl.startsWith('http')) {
-                items.push({ type: 'video', url: cleanVideoUrl });
-                return { resolvedUrl, items };
-            }
-        }
-
-        const domMedia = await page.evaluate(() => {
-            const found = [];
-            const seen = new Set();
-
-            document.querySelectorAll('video').forEach((v) => {
-                if (v.src && v.src.startsWith('http') && !seen.has(v.src)) {
-                    seen.add(v.src);
-                    found.push({ type: 'video', url: v.src });
-                }
-            });
-
-            if (found.length === 0) {
-                document.querySelectorAll('img[src*="scontent"]').forEach((img) => {
-                    if ((img.naturalWidth >= 250 || img.width >= 250) && !seen.has(img.src)) {
-                        seen.add(img.src);
-                        found.push({ type: 'image', url: img.src });
-                    }
-                });
-            }
-            return found;
-        });
-
-        return { resolvedUrl, items: domMedia };
-    } catch (err) {
-        console.warn('[FB] Puppeteer ekstraktor gagal:', err.message);
-        return { resolvedUrl: rawUrl, items: [] };
-    } finally {
-        if (page) await page.close().catch(() => {});
-    }
 }
 
 async function inspectUrlSafe(url) {
@@ -1069,25 +644,6 @@ async function downloadWithYtDlp(url, mode = 'video', allowPlaylist = false) {
     }
 }
 
-async function downloadAndSendViaYtDlp(chatId, url, mode = 'video', allowPlaylist = true) {
-    const filePaths = await downloadWithYtDlp(url, mode, allowPlaylist);
-    try {
-        for (const filePath of filePaths) {
-            if (mode === 'audio') {
-                const media = MessageMedia.fromFilePath(filePath);
-                await sendMediaSafe(chatId, media, { sendMediaAsDocument: true });
-                safeUnlink(filePath);
-            } else {
-                await sendVideoFileFromDisk(chatId, filePath);
-            }
-        }
-    } finally {
-        for (const filePath of filePaths) {
-            safeUnlink(filePath);
-        }
-    }
-}
-
 function setYoutubeSession(chatId, url) {
     const existing = pendingYoutubeChoices.get(chatId);
     if (existing) clearTimeout(existing.timer);
@@ -1107,194 +663,594 @@ function clearYoutubeSession(chatId) {
     }
 }
 
-client.on('message', async (msg) => {
-    if (msg.from === 'status@broadcast') return;
 
-    const text = (msg.body || '').trim();
+// ---------------------------------------------------------------------------
+// Pengiriman pesan (Baileys)
+// ---------------------------------------------------------------------------
+
+async function sendText(jid, text, quoted) {
+    await sock.sendMessage(jid, { text }, quoted ? { quoted } : undefined);
+}
+
+async function react(msg, emoji) {
+    try {
+        await sock.sendMessage(msg.key.remoteJid, { react: { text: emoji, key: msg.key } });
+    } catch {}
+}
+
+function runFfmpeg(args, timeout = 120000) {
+    return new Promise((resolve, reject) => {
+        execFile(ffmpegPath, args, { timeout }, (err, _stdout, stderr) => {
+            if (err) return reject(new Error((stderr || err.message || '').slice(-400)));
+            resolve();
+        });
+    });
+}
+
+function uid() {
+    return `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+// Membuat stiker WebP 512x512 (gambar statis atau video/GIF animasi) memakai ffmpeg
+async function makeSticker(buffer, isVideo) {
+    const id = uid();
+    const inPath = path.join(tempDir, `st_in_${id}`);
+    const outPath = path.join(tempDir, `st_out_${id}.webp`);
+    fs.writeFileSync(inPath, buffer);
+
+    const vf =
+        'scale=512:512:force_original_aspect_ratio=decrease,format=rgba,' +
+        'pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black@0';
+    const qualities = isVideo ? [45, 30, 18] : [80, 60];
+    const maxBytes = isVideo ? 900 * 1024 : 1000 * 1024;
 
     try {
-        if (pendingYoutubeChoices.has(msg.from)) {
+        let out = null;
+        for (const q of qualities) {
+            const args = ['-y', '-i', inPath];
+            if (isVideo) {
+                args.push('-t', '8', '-vf', `fps=12,${vf}`, '-loop', '0');
+            } else {
+                args.push('-frames:v', '1', '-vf', vf);
+            }
+            args.push('-an', '-c:v', 'libwebp', '-q:v', String(q), '-compression_level', '6', outPath);
+            await runFfmpeg(args);
+            out = fs.readFileSync(outPath);
+            if (out.length <= maxBytes) break;
+        }
+        return out;
+    } finally {
+        safeUnlink(inPath);
+        safeUnlink(outPath);
+    }
+}
+
+async function toJpeg(buffer) {
+    const id = uid();
+    const inPath = path.join(tempDir, `img_in_${id}`);
+    const outPath = path.join(tempDir, `img_out_${id}.jpg`);
+    fs.writeFileSync(inPath, buffer);
+    try {
+        await runFfmpeg(['-y', '-i', inPath, '-frames:v', '1', '-q:v', '2', outPath], 60000);
+        return fs.readFileSync(outPath);
+    } finally {
+        safeUnlink(inPath);
+        safeUnlink(outPath);
+    }
+}
+
+async function sendImageBuffer(jid, buffer, contentType, asSticker, quoted) {
+    const opts = quoted ? { quoted } : undefined;
+    if (asSticker) {
+        const webp = await makeSticker(buffer, false);
+        await sock.sendMessage(jid, { sticker: webp }, opts);
+        return;
+    }
+    let sendBuf = buffer;
+    let mime = contentType;
+    if (!/image\/(jpeg|jpg|png)/i.test(contentType)) {
+        try {
+            sendBuf = await toJpeg(buffer);
+            mime = 'image/jpeg';
+        } catch {}
+    }
+    try {
+        await sock.sendMessage(jid, { image: sendBuf, mimetype: mime }, opts);
+    } catch {
+        console.warn('[WA] Gagal kirim sebagai gambar, mengirim sebagai dokumen...');
+        await sock.sendMessage(
+            jid,
+            { document: sendBuf, mimetype: mime, fileName: `gambar_${Date.now()}.jpg` },
+            opts
+        );
+    }
+}
+
+async function sendVideoFileFromDisk(jid, rawFilePath, quoted) {
+    const opts = quoted ? { quoted } : undefined;
+    let finalPath = rawFilePath;
+    try {
+        finalPath = await ensureWhatsAppCompatibleVideo(rawFilePath);
+        const sizeMB = fs.statSync(finalPath).size / (1024 * 1024);
+        if (sizeMB > 60) {
+            await sock.sendMessage(
+                jid,
+                { document: { url: finalPath }, mimetype: 'video/mp4', fileName: `video_${Date.now()}.mp4` },
+                opts
+            );
+            return;
+        }
+        try {
+            await sock.sendMessage(jid, { video: { url: finalPath }, mimetype: 'video/mp4' }, opts);
+        } catch (err) {
+            console.warn('[WA] Gagal kirim sebagai video, mengirim sebagai dokumen...', err.message);
+            await sock.sendMessage(
+                jid,
+                { document: { url: finalPath }, mimetype: 'video/mp4', fileName: `video_${Date.now()}.mp4` },
+                opts
+            );
+        }
+    } finally {
+        safeUnlink(rawFilePath);
+        if (finalPath !== rawFilePath) safeUnlink(finalPath);
+    }
+}
+
+async function sendAudioFileFromDisk(jid, filePath, quoted) {
+    const opts = quoted ? { quoted } : undefined;
+    try {
+        await sock.sendMessage(jid, { audio: { url: filePath }, mimetype: 'audio/mpeg' }, opts);
+    } catch {
+        await sock.sendMessage(
+            jid,
+            { document: { url: filePath }, mimetype: 'audio/mpeg', fileName: `audio_${Date.now()}.mp3` },
+            opts
+        );
+    }
+}
+
+async function downloadUrlToTempFile(mediaUrl, referer = '', defaultExt = 'mp4') {
+    const headers = { 'User-Agent': USER_AGENT, Accept: '*/*' };
+    if (referer) headers['Referer'] = referer;
+
+    const res = await fetch(mediaUrl, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(120000),
+        headers
+    });
+    if (!res.ok) throw new Error(`Gagal mengunduh stream media (${res.status})`);
+
+    const declared = Number(res.headers.get('content-length') || 0);
+    if (declared > MAX_DOWNLOAD_BYTES) {
+        if (res.body) await res.body.cancel();
+        throw new Error('File terlalu besar (maks 100 MB).');
+    }
+
+    const filePath = path.join(tempDir, `stream_${uid()}.${defaultExt}`);
+    try {
+        await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(filePath));
+    } catch (err) {
+        safeUnlink(filePath);
+        throw err;
+    }
+    if (fs.statSync(filePath).size > MAX_DOWNLOAD_BYTES) {
+        safeUnlink(filePath);
+        throw new Error('File terlalu besar (maks 100 MB).');
+    }
+    return filePath;
+}
+
+async function fetchImageBuffer(mediaUrl, referer = 'https://www.instagram.com/') {
+    const res = await fetch(mediaUrl, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(30000),
+        headers: {
+            'User-Agent': USER_AGENT,
+            Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+            Referer: referer
+        }
+    });
+    if (!res.ok) throw new Error(`Gagal mengunduh file media (${res.status})`);
+    const contentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return { buffer, contentType };
+}
+
+async function sendExtractedMediaItems(jid, items, referer, makeStickerFlag, quoted) {
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        console.log(`Mengirim media ${i + 1}/${items.length} (${item.type})...`);
+
+        if (item.type === 'video') {
+            const tempVideo = await downloadUrlToTempFile(item.url, referer, 'mp4');
+            await sendVideoFileFromDisk(jid, tempVideo, quoted);
+        } else {
+            const { buffer, contentType } = await fetchImageBuffer(item.url, referer);
+            await sendImageBuffer(jid, buffer, contentType, makeStickerFlag, quoted);
+        }
+    }
+}
+
+async function downloadAndSendViaYtDlp(jid, url, mode = 'video', allowPlaylist = true, quoted) {
+    const filePaths = await downloadWithYtDlp(url, mode, allowPlaylist);
+    try {
+        for (const filePath of filePaths) {
+            if (mode === 'audio') {
+                await sendAudioFileFromDisk(jid, filePath, quoted);
+                safeUnlink(filePath);
+            } else {
+                await sendVideoFileFromDisk(jid, filePath, quoted);
+            }
+        }
+    } finally {
+        for (const filePath of filePaths) safeUnlink(filePath);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Penanganan pesan masuk
+// ---------------------------------------------------------------------------
+
+function unwrapContent(message) {
+    let m = message;
+    for (let i = 0; i < 5 && m; i++) {
+        const inner =
+            m.ephemeralMessage?.message ||
+            m.viewOnceMessage?.message ||
+            m.viewOnceMessageV2?.message ||
+            m.viewOnceMessageV2Extension?.message ||
+            m.documentWithCaptionMessage?.message ||
+            m.editedMessage?.message;
+        if (!inner) break;
+        m = inner;
+    }
+    return m || {};
+}
+
+function extractText(content) {
+    return (
+        content.conversation ||
+        content.extendedTextMessage?.text ||
+        content.imageMessage?.caption ||
+        content.videoMessage?.caption ||
+        ''
+    ).trim();
+}
+
+async function handleMessage(msg) {
+    if (!msg.message || msg.key.fromMe) return;
+    const jid = msg.key.remoteJid;
+    if (!jid || jid === 'status@broadcast' || jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) return;
+
+    const content = unwrapContent(msg.message);
+    const text = extractText(content);
+
+    try {
+        if (pendingYoutubeChoices.has(jid)) {
             const normalized = text.toLowerCase();
 
             if (normalized === 'batal' || normalized === 'cancel' || normalized === '0') {
-                clearYoutubeSession(msg.from);
-                await msg.reply('Unduhan YouTube dibatalkan.');
+                clearYoutubeSession(jid);
+                await sendText(jid, 'Unduhan YouTube dibatalkan.', msg);
                 return;
             }
 
             const isVideoChoice = normalized === '1' || normalized === 'video';
-            const isMusicChoice =
-                normalized === '2' ||
-                normalized === 'music' ||
-                normalized === 'musik' ||
-                normalized === 'mp3' ||
-                normalized === 'audio';
+            const isMusicChoice = ['2', 'music', 'musik', 'mp3', 'audio'].includes(normalized);
 
             if (isVideoChoice || isMusicChoice) {
-                const session = pendingYoutubeChoices.get(msg.from);
-                clearYoutubeSession(msg.from);
+                const session = pendingYoutubeChoices.get(jid);
+                clearYoutubeSession(jid);
                 const mode = isMusicChoice ? 'audio' : 'video';
 
-                await msg.react('⏳');
-                await downloadAndSendViaYtDlp(msg.from, session.url, mode, false);
-                await msg.react('✅');
+                await react(msg, '⏳');
+                await downloadAndSendViaYtDlp(jid, session.url, mode, false, msg);
+                await react(msg, '✅');
                 return;
             }
         }
 
-        if (msg.hasMedia) {
-            const media = await msg.downloadMedia();
-            if (!media) return;
-
-            const isImage = media.mimetype.startsWith('image/');
-            const isVideoOrGif = media.mimetype.startsWith('video/');
-
-            if (isImage || isVideoOrGif) {
-                const jenis = isVideoOrGif ? 'video/GIF' : 'gambar';
-                console.log(`Memproses stiker ${jenis} dari ${msg.from}...`);
-
-                await client.sendMessage(msg.from, media, {
-                    sendMediaAsSticker: true,
-                    stickerName: 'Stiker Otomatis',
-                    stickerAuthor: 'WA Bot'
-                });
-                return;
-            }
+        // Gambar / video / GIF yang dikirim langsung -> jadikan stiker
+        const mediaNode = content.imageMessage || content.videoMessage;
+        if (mediaNode) {
+            const isVideo = Boolean(content.videoMessage);
+            console.log(`Memproses stiker ${isVideo ? 'video/GIF' : 'gambar'} dari ${jid}...`);
+            const buffer = await baileys.downloadMediaMessage(
+                msg,
+                'buffer',
+                {},
+                { logger: baileysLogger, reuploadRequest: sock.updateMediaMessage }
+            );
+            const webp = await makeSticker(buffer, isVideo);
+            await sock.sendMessage(jid, { sticker: webp }, { quoted: msg });
+            return;
         }
 
         const urlMatch = text.match(/https?:\/\/[^\s"'<>]+/i);
-        if (urlMatch) {
-            const url = urlMatch[0];
+        if (!urlMatch) return;
 
-            if (!isSafePublicUrl(url)) {
-                throw new Error('URL tidak valid.');
-            }
+        const url = urlMatch[0];
+        if (!isSafePublicUrl(url)) throw new Error('URL tidak valid.');
 
-            if (isYoutubeUrl(url)) {
-                setYoutubeSession(msg.from, url);
-                await msg.reply(
-                    'Link YouTube terdeteksi. Pilih format unduhan dengan membalas:\n\n' +
+        if (isYoutubeUrl(url)) {
+            setYoutubeSession(jid, url);
+            await sendText(
+                jid,
+                'Link YouTube terdeteksi. Pilih format unduhan dengan membalas:\n\n' +
                     '*1* atau *video* (Unduh Video MP4)\n' +
                     '*2* atau *music* (Unduh Audio MP3)\n\n' +
-                    '_(Ketik *0* untuk batal, berlaku 2 menit)_'
-                );
+                    '_(Ketik *0* untuk batal, berlaku 2 menit)_',
+                msg
+            );
+            return;
+        }
+
+        const makeStickerFlag = /\bstiker\b/i.test(text);
+        console.log(`Mendeteksi link dari ${jid}: ${url}`);
+        await react(msg, '⏳');
+
+        if (isInstagramUrl(url)) {
+            const items = await extractInstagramMedia(url);
+            if (items.length > 0) {
+                await sendExtractedMediaItems(jid, items, 'https://www.instagram.com/', makeStickerFlag, msg);
+                await react(msg, '✅');
                 return;
             }
+        }
 
-            const makeSticker = /\bstiker\b/i.test(text);
-            console.log(`Mendeteksi link dari ${msg.from}: ${url}`);
-            await msg.react('⏳');
-
-            if (isInstagramUrl(url)) {
-                const igItems = await extractInstagramMedia(url);
-                if (igItems.length > 0) {
-                    await sendExtractedMediaItems(msg.from, igItems, 'https://www.instagram.com/', makeSticker);
-                    await msg.react('✅');
-                    return;
-                }
-            }
-
-            if (isTikTokUrl(url)) {
-                const ttItems = await extractTikTokMedia(url);
-                if (ttItems.length > 0) {
-                    await sendExtractedMediaItems(msg.from, ttItems, 'https://www.tiktok.com/', makeSticker);
-                    await msg.react('✅');
-                    return;
-                }
-                await downloadAndSendViaYtDlp(msg.from, url, 'video', true);
-                await msg.react('✅');
+        if (isTikTokUrl(url)) {
+            const items = await extractTikTokMedia(url);
+            if (items.length > 0) {
+                await sendExtractedMediaItems(jid, items, 'https://www.tiktok.com/', makeStickerFlag, msg);
+                await react(msg, '✅');
                 return;
             }
+            await downloadAndSendViaYtDlp(jid, url, 'video', true, msg);
+            await react(msg, '✅');
+            return;
+        }
 
-            if (isTwitterUrl(url)) {
-                const xItems = await extractTwitterMedia(url);
-                if (xItems.length > 0) {
-                    await sendExtractedMediaItems(msg.from, xItems, 'https://x.com/', makeSticker);
-                    await msg.react('✅');
-                    return;
-                }
-                await downloadAndSendViaYtDlp(msg.from, url, 'video', true);
-                await msg.react('✅');
+        if (isTwitterUrl(url)) {
+            const items = await extractTwitterMedia(url);
+            if (items.length > 0) {
+                await sendExtractedMediaItems(jid, items, 'https://x.com/', makeStickerFlag, msg);
+                await react(msg, '✅');
                 return;
             }
+            await downloadAndSendViaYtDlp(jid, url, 'video', true, msg);
+            await react(msg, '✅');
+            return;
+        }
 
-            if (isThreadsUrl(url)) {
-                const threadsItems = await extractThreadsMedia(url);
-                if (threadsItems.length > 0) {
-                    await sendExtractedMediaItems(msg.from, threadsItems, 'https://www.threads.net/', makeSticker);
-                    await msg.react('✅');
-                    return;
-                }
+        if (isThreadsUrl(url)) {
+            const items = await extractThreadsMedia(url);
+            if (items.length > 0) {
+                await sendExtractedMediaItems(jid, items, 'https://www.threads.net/', makeStickerFlag, msg);
+                await react(msg, '✅');
+                return;
             }
+        }
 
-            if (isFacebookUrl(url)) {
+        if (isFacebookUrl(url)) {
+            await downloadAndSendViaYtDlp(jid, url, 'video', true, msg);
+            await react(msg, '✅');
+            return;
+        }
+
+        const info = await inspectUrlSafe(url);
+
+        if (info.type === 'image') {
+            const { buffer, contentType } = await fetchImageBuffer(info.directUrl, url);
+            await sendImageBuffer(jid, buffer, contentType, makeStickerFlag, msg);
+            await react(msg, '✅');
+            return;
+        }
+
+        if (info.type === 'direct_file') {
+            const ct = (info.contentType || '').toLowerCase();
+            if (ct.startsWith('video/')) {
+                const tmp = await downloadUrlToTempFile(info.directUrl, url, 'mp4');
+                await sendVideoFileFromDisk(jid, tmp, msg);
+            } else {
+                const ext = (path.extname(new URL(info.directUrl).pathname) || '.bin').slice(1, 8);
+                const tmp = await downloadUrlToTempFile(info.directUrl, url, ext);
                 try {
-                    await downloadAndSendViaYtDlp(msg.from, url, 'video', true);
-                    await msg.react('✅');
-                    return;
-                } catch {
-                    console.log('[FB] Mencoba mengekstrak link share/post Facebook via Puppeteer...');
-                    const fbData = await extractFacebookMediaWithPuppeteer(url);
-                    if (fbData.items.length > 0) {
-                        await sendExtractedMediaItems(msg.from, fbData.items, 'https://www.facebook.com/', makeSticker);
-                        await msg.react('✅');
-                        return;
-                    }
-                    if (fbData.resolvedUrl && fbData.resolvedUrl !== url) {
-                        await downloadAndSendViaYtDlp(msg.from, fbData.resolvedUrl, 'video', true);
-                        await msg.react('✅');
-                        return;
-                    }
-                    throw new Error('Media Facebook tidak ditemukan atau bersifat privat.');
+                    await sock.sendMessage(
+                        jid,
+                        {
+                            document: { url: tmp },
+                            mimetype: ct.split(';')[0] || 'application/octet-stream',
+                            fileName: `file_${Date.now()}.${ext}`
+                        },
+                        { quoted: msg }
+                    );
+                } finally {
+                    safeUnlink(tmp);
                 }
             }
+            await react(msg, '✅');
+            return;
+        }
 
-            const info = await inspectUrlSafe(url);
-
-            if (info.type === 'image') {
-                const media = await fetchMediaAsMessageMedia(info.directUrl, url);
-                await sendMediaSafe(msg.from, media, {
-                    sendMediaAsSticker: makeSticker,
-                    stickerName: 'Stiker Otomatis',
-                    stickerAuthor: 'WA Bot'
-                });
-                await msg.react('✅');
-                return;
-            }
-
-            if (info.type === 'direct_file') {
-                const media = await MessageMedia.fromUrl(info.directUrl, { unsafeMime: true });
-                const sendAsDoc = !media.mimetype.startsWith('video/');
-                await sendMediaSafe(msg.from, media, {
-                    sendMediaAsDocument: sendAsDoc
-                });
-                await msg.react('✅');
-                return;
-            }
-
-            try {
-                await downloadAndSendViaYtDlp(msg.from, info.directUrl || url, 'video', true);
-                await msg.react('✅');
-            } catch (ytError) {
-                if (info.ogImageUrl) {
-                    const media = await fetchMediaAsMessageMedia(info.ogImageUrl, url);
-                    await sendMediaSafe(msg.from, media, {
-                        sendMediaAsSticker: makeSticker,
-                        stickerName: 'Stiker Otomatis',
-                        stickerAuthor: 'WA Bot'
-                    });
-                    await msg.react('✅');
-                } else {
-                    throw ytError;
-                }
+        try {
+            await downloadAndSendViaYtDlp(jid, info.directUrl || url, 'video', true, msg);
+            await react(msg, '✅');
+        } catch (ytError) {
+            if (info.ogImageUrl) {
+                const { buffer, contentType } = await fetchImageBuffer(info.ogImageUrl, url);
+                await sendImageBuffer(jid, buffer, contentType, makeStickerFlag, msg);
+                await react(msg, '✅');
+            } else {
+                throw ytError;
             }
         }
     } catch (error) {
         console.error('Terjadi kesalahan:', error.message || error);
-        await msg.react('❌');
-        await msg.reply('Gagal mengunduh media. Pastikan link bersifat publik, valid, dan bukan akun private.');
+        await react(msg, '❌');
+        await sendText(
+            jid,
+            'Gagal mengunduh media. Pastikan link bersifat publik, valid, dan bukan akun private.',
+            msg
+        ).catch(() => {});
     }
-});
+}
+
+// ---------------------------------------------------------------------------
+// Koneksi WhatsApp (Baileys)
+// ---------------------------------------------------------------------------
+
+function askQuestion(question) {
+    return new Promise((resolve) => {
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        rl.question(question, (answer) => {
+            rl.close();
+            resolve(answer);
+        });
+    });
+}
+
+function normalizePhone(raw) {
+    let digits = String(raw || '').replace(/\D/g, '');
+    if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+    return digits;
+}
+
+let cachedPhone = null;
+let reconnecting = false;
+let messageQueue = Promise.resolve();
+
+async function startSocket() {
+    const {
+        default: makeWASocket,
+        useMultiFileAuthState,
+        DisconnectReason,
+        fetchLatestBaileysVersion,
+        Browsers,
+        makeCacheableSignalKeyStore
+    } = baileys;
+
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    let version;
+    try {
+        ({ version } = await fetchLatestBaileysVersion());
+    } catch {}
+
+    sock = makeWASocket({
+        ...(version ? { version } : {}),
+        logger: baileysLogger,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, baileysLogger)
+        },
+        browser: Browsers.ubuntu('Chrome'),
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+        generateHighQualityLinkPreview: false
+    });
+
+    const currentSock = sock;
+    let pairingRequested = false;
+
+    currentSock.ev.on('creds.update', saveCreds);
+
+    currentSock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr && !state.creds.registered && !pairingRequested) {
+            pairingRequested = true;
+
+            if (process.env.USE_QR === '1') {
+                console.log('Scan QR Code ini menggunakan WhatsApp di perangkat lain:');
+                qrcode.generate(qr, { small: true });
+                pairingRequested = false;
+                return;
+            }
+
+            try {
+                if (!cachedPhone) {
+                    cachedPhone = normalizePhone(process.env.WA_NUMBER);
+                }
+                if (!cachedPhone && process.stdin.isTTY) {
+                    console.log('');
+                    cachedPhone = normalizePhone(
+                        await askQuestion('Masukkan nomor WhatsApp bot (contoh 6281234567890): ')
+                    );
+                }
+                if (!cachedPhone) {
+                    console.log('Nomor tidak tersedia. Jalankan dengan: WA_NUMBER=628xxxx node index.js');
+                    console.log('Atau pakai QR dari perangkat lain: USE_QR=1 node index.js');
+                    process.exit(1);
+                }
+
+                const code = await currentSock.requestPairingCode(cachedPhone);
+                const pretty = code.match(/.{1,4}/g).join('-');
+                console.log('');
+                console.log('==========================================');
+                console.log(`  KODE PAIRING: ${pretty}`);
+                console.log('==========================================');
+                console.log('Di HP: WhatsApp > Perangkat Tertaut > Tautkan Perangkat');
+                console.log('> "Tautkan dengan nomor telepon saja" > masukkan kode di atas.');
+                console.log('(Kode berlaku sebentar, segera masukkan.)');
+                console.log('');
+            } catch (err) {
+                console.error('[Bot WA] Gagal meminta kode pairing:', err.message || err);
+                process.exit(1);
+            }
+        }
+
+        if (connection === 'open') {
+            console.log('Bot WA (All-in-One Downloader: IG, TikTok, FB, X, Threads, YouTube & Stiker) aktif!');
+        }
+
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            console.log(`[Bot WA] Koneksi terputus (kode: ${statusCode ?? 'tidak diketahui'}).`);
+
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log('[Bot WA] Sesi keluar dari WhatsApp. Menghapus sesi lama, jalankan ulang untuk login.');
+                fs.rmSync(authDir, { recursive: true, force: true });
+                process.exit(1);
+            }
+
+            if (statusCode === DisconnectReason.connectionReplaced) {
+                console.log('[Bot WA] Sesi dipakai di tempat lain. Berhenti.');
+                process.exit(1);
+            }
+
+            if (reconnecting) return;
+            reconnecting = true;
+            const delay = statusCode === DisconnectReason.restartRequired ? 500 : 3000;
+            setTimeout(async () => {
+                reconnecting = false;
+                try {
+                    await startSocket();
+                } catch (err) {
+                    console.error('[Bot WA] Gagal menyambung ulang:', err.message || err);
+                    process.exit(1);
+                }
+            }, delay);
+        }
+    });
+
+    currentSock.ev.on('messages.upsert', ({ messages, type }) => {
+        if (type !== 'notify') return;
+        for (const m of messages) {
+            // Antrian berurutan agar ffmpeg/yt-dlp tidak jalan bersamaan (hemat RAM)
+            messageQueue = messageQueue
+                .then(() => handleMessage(m))
+                .catch((err) => console.error('[Bot WA] Error pesan:', err.message || err));
+        }
+    });
+}
+
+async function main() {
+    baileys = await import('@whiskeysockets/baileys');
+    const pino = (await import('pino')).default;
+    baileysLogger = pino({ level: process.env.DEBUG_BAILEYS === '1' ? 'debug' : 'silent' });
+    await startSocket();
+}
 
 process.on('uncaughtException', (err) => {
     console.error('[Bot WA] Uncaught Exception:', err);
@@ -1304,12 +1260,11 @@ process.on('unhandledRejection', (reason) => {
     console.error('[Bot WA] Unhandled Rejection:', reason);
 });
 
-client.on('disconnected', (reason) => {
-    console.log('[Bot WA] Terputus dari WhatsApp Web:', reason);
-    process.exit(1);
-});
+if (require.main === module) {
+    main().catch((err) => {
+        console.error('[Bot WA] Gagal memulai bot:', err);
+        process.exit(1);
+    });
+}
 
-client.initialize().catch((err) => {
-    console.error('[Bot WA] Gagal menginisialisasi WhatsApp Web:', err);
-    process.exit(1);
-});
+module.exports = { handleMessage, makeSticker, _setSock: (s, b) => { sock = s; baileys = b; } };
