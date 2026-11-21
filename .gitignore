@@ -1,0 +1,15 @@
+# Dependensi Node.js
+node_modules/
+
+# Sesi Login WhatsApp (JANGAN DI-UPLOAD KE GITHUB!)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Folder Unduhan Sementara
+temp_downloads/
+
+# File Lingkungan & Log
+.env
+*.log
+npm-debug.log*
+.DS_Store
