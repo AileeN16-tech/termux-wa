@@ -135,13 +135,20 @@ const puppeteerArgs = [
     // Flag khusus Linux/Termux Android (Chromium 133+)
     ...(process.platform === 'linux' || isTermux
         ? [
-            '--no-zygote',
             '--disable-dbus',
             '--disable-crash-reporter',
-            '--disable-features=VizDisplayCompositor,UseOzonePlatform'
+            // Jalankan GPU & network service di dalam proses utama agar tidak crash
+            // saat Chromium meluncurkan proses anak di Android
+            '--in-process-gpu',
+            '--enable-features=NetworkServiceInProcess'
         ]
         : [])
 ];
+
+// LD_PRELOAD (libtermux-exec.so) tidak boleh diwariskan ke proses anak Chromium,
+// kalau tidak muncul error "CANNOT LINK EXECUTABLE" lalu GPU/network service crash
+const chromeEnv = { ...process.env };
+delete chromeEnv.LD_PRELOAD;
 
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -153,6 +160,7 @@ const client = new Client({
         protocolTimeout: 120000,
         dumpio: process.env.DEBUG_CHROME === '1',
         executablePath: executablePath,
+        env: chromeEnv,
         args: puppeteerArgs
     }
 });
